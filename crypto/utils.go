@@ -29,22 +29,28 @@ func Trashfication(source []byte, minLength, maxLength int) (result []byte) {
 		minLength, maxLength = maxLength, minLength
 	}
 
-	currentLen := len(source)
+	if len(source) >= maxLength {
+		result = make([]byte, len(source))
+		copy(result, source)
+		return result
+	}
 
-	var targetLen int
+	targetLen := len(source)
 
-	if currentLen > maxLength {
-		targetLen = maxLength
-	} else if currentLen < minLength {
+	if minLength > targetLen {
 		targetLen = minLength
-	} else {
-		targetLen = currentLen + rand.Intn(maxLength-currentLen+1)
+	}
+
+	if targetLen < maxLength {
+		extra := rand.Intn(maxLength - targetLen + 1)
+		targetLen += extra
 	}
 
 	result = make([]byte, targetLen)
+
 	copy(result, source)
 
-	for i := currentLen; i < targetLen; i++ {
+	for i := len(source); i < targetLen; i++ {
 		result[i] = byte(rand.Intn(256))
 	}
 
