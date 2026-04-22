@@ -9,6 +9,7 @@ import (
 	"net"
 	"os/exec"
 	"smiletun-client/crypto"
+	"smiletun-client/logger"
 	"smiletun-client/tunnel"
 	"time"
 
@@ -24,25 +25,36 @@ type Client struct {
 	conn         net.Conn
 	sessionKey   []byte
 	tunnel       *tunnel.Tunnel
+	logger       *logger.Logger
 }
 
-func NewClient(host string, port int, initPassword [32]byte, username, password [16]byte) (client *Client, err error) {
+func NewClient(host string, port int, initPassword [32]byte, username, password [16]byte, logger *logger.Logger) (client *Client, err error) {
+	logger.Info("Getting default route information for host: %s", host)
+
 	routeInfo, err := getDefaultRouteNetlink()
 	if err != nil {
+		logger.Error("Failed to get route information: %v", err)
 		return nil, fmt.Errorf("error retrieving route information: %w", err)
 	}
 
+	logger.Debug("Default route found - Gateway: %s, Interface: %s", routeInfo.Gateway, routeInfo.Interface)
+
+	logger.Debug("Adding server route: %s via %s dev %s", host, routeInfo.Gateway, routeInfo.Interface)
 	cmd := exec.Command("ip", "route", "add", host,
 		"via", routeInfo.Gateway, "dev", routeInfo.Interface)
 
 	if err := cmd.Run(); err != nil && err.Error() != "exit status 2" {
+		logger.Error("Failed to add server route: %v", err)
 		return nil, fmt.Errorf("failed to add server route: %w", err)
 	}
 
+	logger.Debug("Server route added successfully")
+
+	logger.Info("Creating TUN interface: smile-tun0")
 	tun, err := tunnel.NewTunnel(
 		"smile-tun0",
 		1500,
-		net.ParseIP("10.0.83.1"),
+		net.ParseIP("10.0.83.2"),
 		net.IPv4Mask(255, 255, 255, 0),
 		[]*net.IPNet{
 			{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
@@ -50,8 +62,11 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 	)
 
 	if err != nil {
+		logger.Error("Failed to create tunnel: %v", err)
 		return nil, fmt.Errorf("error create tunnel: %v", err)
 	}
+
+	logger.Info("TUN interface created successfully")
 
 	return &Client{
 		host:         host,
@@ -60,25 +75,33 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 		username:     username,
 		password:     password,
 		tunnel:       &tun,
+		logger:       logger,
 	}, nil
 }
 
 func (c *Client) Run() (err error) {
 	addr := fmt.Sprintf("%s:%d", c.host, c.port)
+
+	c.logger.Info("Connecting to the server at %s", addr)
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
+		c.logger.Error("Failed to connect to server: %v", err)
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 	c.conn = conn
+	c.logger.Info("Connected to server successfully")
 
 	timestamp := time.Now().Unix()
 	timestampBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(timestampBytes, uint64(timestamp))
 
+	c.logger.Debug("Creating authentication packet with timestamp: %d", timestamp)
+
 	packet := make([]byte, 24)
 	copy(packet[:16], c.username[:])
 	copy(packet[16:], timestampBytes)
 
+	c.logger.Debug("Encrypting authentication packet with init password")
 	cipherPacket, nonce, _ := crypto.EncryptChaCha20Poly1305(packet, c.initPassword[:])
 
 	rawPacket := make([]byte, len(nonce)+len(cipherPacket))
@@ -88,60 +111,87 @@ func (c *Client) Run() (err error) {
 
 	packet = crypto.Trashfication(rawPacket, 400, 1317)
 
+	c.logger.Debug("Sending authentication packet (size: %d bytes)", len(packet))
 	c.conn.Write(packet)
+	c.logger.Info("Authentication packet sent")
 
+	c.logger.Debug("Waiting for salt packet from server")
 	saltPacket := make([]byte, 60)
 	if _, err = io.ReadFull(conn, saltPacket); err != nil {
+		c.logger.Error("Failed to read salt packet: %v", err)
 		return
 	}
+	c.logger.Debug("Salt packet received (size: %d bytes)", len(saltPacket))
 
 	nonce = saltPacket[:12]
 	salt, err := crypto.DecryptChaCha20Poly1305(saltPacket[12:], nonce, c.initPassword[:])
+	if err != nil {
+		c.logger.Error("Failed to decrypt salt packet: %v", err)
+		return
+	}
+	c.logger.Debug("Salt decrypted successfully")
 
+	c.logger.Debug("Deriving session key from password and salt")
 	sessionKeyHasher := sha256.New()
 	sessionKeyHasher.Write(c.password[:])
 	sessionKeyHasher.Write([]byte(":"))
 	sessionKeyHasher.Write(salt)
 
 	c.sessionKey = sessionKeyHasher.Sum(nil)
+	c.logger.Info("Session key derived successfully")
 
+	c.logger.Info("Starting tunnel")
 	c.startTunnel()
 
 	return nil
 }
 
 func (c *Client) startTunnel() (err error) {
+	c.logger.Info("Bringing TUN interface up")
 	if err := (*c.tunnel).Up(); err != nil {
+		c.logger.Error("Failed to bring TUN interface up: %v", err)
 		return err
 	}
 
-	log.Printf("Tunnel %s is up with IP %s", (*c.tunnel).Name(), (*c.tunnel).IP())
+	c.logger.Info("Tunnel %s is up with IP %s", (*c.tunnel).Name(), (*c.tunnel).IP())
 
 	packet := make([]byte, (*c.tunnel).MTU())
+	packetCount := 0
+
+	c.logger.Info("Starting packet processing loop")
 	for {
 		n, err := (*c.tunnel).Read(packet)
 
 		if err != nil {
+			c.logger.Error("Failed to read from tunnel: %v", err)
 			return err
 		}
 
+		packetCount++
 		sourceAddress := packet[12:16]
 		destinationAddress := packet[16:20]
 
-		log.Printf("Packet")
-		log.Printf("\tSource: %d.%d.%d.%d", sourceAddress[0], sourceAddress[1], sourceAddress[2], sourceAddress[3])
-		log.Printf("\tDestination: %d.%d.%d.%d", destinationAddress[0], destinationAddress[1], destinationAddress[2], destinationAddress[3])
-		log.Printf("\tProtocol: %d", packet[9])
+		c.logger.Trace("Packet #%d", packetCount)
+
+		c.logger.Trace("\tSource: %d.%d.%d.%d", sourceAddress[0], sourceAddress[1], sourceAddress[2], sourceAddress[3])
+		c.logger.Trace("\tDestination: %d.%d.%d.%d", destinationAddress[0], destinationAddress[1], destinationAddress[2], destinationAddress[3])
+		c.logger.Trace("\tProtocol: %d", packet[9])
+
+		c.logger.Debug("Processing packet #%d (size: %d bytes)", packetCount, n)
 
 		packet = packet[:n]
 
+		c.logger.Trace("Encrypting packet with session key")
 		cipherPacket, nonce, err := crypto.EncryptChaCha20Poly1305(packet, c.sessionKey[:])
 		if err != nil {
+			c.logger.Error("Failed to encrypt packet: %v", err)
 			log.Printf("%v", err)
 		}
+		c.logger.Trace("Packet encrypted (cipher size: %d bytes)", len(cipherPacket))
 
 		lenPacketBytes := make([]byte, 2)
 		binary.BigEndian.PutUint16(lenPacketBytes[0:2], uint16(len(nonce)+len(cipherPacket)+2))
+		c.logger.Trace("Total packet size: %d bytes", len(nonce)+len(cipherPacket)+2)
 
 		finallyPacket := make([]byte, len(nonce)+len(cipherPacket)+2)
 		finallyPacket[0] = lenPacketBytes[0] ^ c.sessionKey[0]
@@ -150,10 +200,15 @@ func (c *Client) startTunnel() (err error) {
 		copy(finallyPacket[2:14], nonce)
 		copy(finallyPacket[14:14+len(cipherPacket)], cipherPacket)
 
-		if _, err := c.conn.Write(crypto.Trashfication(finallyPacket, 400, 1300)); err != nil {
+		trashPacket := crypto.Trashfication(finallyPacket, 400, 1300)
+		c.logger.Trace("Added trashfication (final size: %d bytes)", len(trashPacket))
+
+		if _, err := c.conn.Write(trashPacket); err != nil {
+			c.logger.Error("Failed to send packet to server: %v", err)
 			log.Printf("%v", err)
 		}
 
+		c.logger.Debug("Packet #%d sent to server", packetCount)
 	}
 
 	return nil
@@ -186,8 +241,6 @@ func getDefaultRouteNetlink() (*RouteInfo, error) {
 					info.Interface = link.Attrs().Name
 				}
 			}
-
-			fmt.Println(route)
 
 			if info.Gateway != "" && info.Interface != "" {
 				return info, nil
