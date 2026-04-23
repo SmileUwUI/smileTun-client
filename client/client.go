@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"os/exec"
 	"smiletun-client/crypto"
@@ -51,22 +50,6 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 
 	logger.Debug("Server route added successfully")
 
-	logger.Info("Creating TUN interface: smile-tun0")
-	tun, err := tunnel.NewTunnel(
-		"smile-tun0",
-		1500,
-		net.ParseIP("10.0.83.2"),
-		net.IPv4Mask(255, 255, 255, 0),
-		[]*net.IPNet{
-			{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
-		},
-	)
-
-	if err != nil {
-		logger.Error("Failed to create tunnel: %v", err)
-		return nil, fmt.Errorf("error create tunnel: %v", err)
-	}
-
 	logger.Info("TUN interface created successfully")
 
 	return &Client{
@@ -75,7 +58,6 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 		initPassword: initPassword,
 		username:     username,
 		password:     password,
-		tunnel:       &tun,
 		logger:       logger,
 	}, nil
 }
@@ -90,6 +72,7 @@ func (c *Client) Run() (err error) {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 	c.conn = conn.(*net.TCPConn)
+	c.conn.SetNoDelay(true)
 	c.logger.Info("Connected to server successfully")
 
 	timestamp := time.Now().Unix()
@@ -117,11 +100,12 @@ func (c *Client) Run() (err error) {
 	c.logger.Info("Authentication packet sent")
 
 	c.logger.Debug("Waiting for salt packet from server")
-	saltPacket := make([]byte, 60)
-	if _, err = io.ReadFull(conn, saltPacket); err != nil {
+	saltPacket := make([]byte, 4096)
+	if _, err = c.conn.Read(saltPacket); err != nil {
 		c.logger.Error("Failed to read salt packet: %v", err)
 		return
 	}
+	saltPacket = saltPacket[:60]
 	c.logger.Debug("Salt packet received (size: %d bytes)", len(saltPacket))
 
 	nonce = saltPacket[:12]
@@ -139,10 +123,48 @@ func (c *Client) Run() (err error) {
 	sessionKeyHasher.Write(salt)
 
 	c.sessionKey = sessionKeyHasher.Sum(nil)
+
+	cipherOkPacket, nonce, _ := crypto.EncryptChaCha20Poly1305([]byte{0xFF}, c.sessionKey)
+
+	okPacket := make([]byte, len(cipherOkPacket)+len(nonce))
+	copy(okPacket[:12], nonce)
+	copy(okPacket[12:], cipherOkPacket)
+
+	c.conn.Write(crypto.Trashfication(okPacket, 300, 1300))
+	ipPacket := make([]byte, 4096)
+	if _, err = c.conn.Read(ipPacket); err != nil {
+		c.logger.Error("Failed to read salt packet: %v", err)
+		return
+	}
+	ipPacket = ipPacket[:32]
+
+	ip, err := crypto.DecryptChaCha20Poly1305(ipPacket[12:], ipPacket[:12], c.sessionKey)
+	if err != nil {
+		c.logger.Error("Failed to decrypt salt packet: %v", err)
+		return
+	}
+
+	c.logger.Info("Creating TUN interface: smile-tun0")
+	tun, err := tunnel.NewTunnel(
+		"smile-tun0",
+		1500,
+		net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])),
+		net.IPv4Mask(255, 255, 255, 0),
+		[]*net.IPNet{
+			{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
+		},
+	)
+
+	if err != nil {
+		c.logger.Error("Failed to create tunnel: %v", err)
+		return fmt.Errorf("error create tunnel: %v", err)
+	}
+
+	c.tunnel = &tun
+
 	c.logger.Info("Session key derived successfully")
 
 	c.logger.Info("Starting tunnel")
-	c.conn.SetNoDelay(true)
 	c.startTunnel()
 
 	return nil
@@ -172,10 +194,8 @@ func (c *Client) startTunnel() (err error) {
 		packet := NewPacket(rawPacket[:n], c.logger)
 
 		c.logger.Trace("Packet #%d", c.countSent)
-
 		c.logger.Trace("\tSource: %s", packet.SourceAddress.String())
 		c.logger.Trace("\tDestination: %s", packet.DestinationAddress.String())
-
 		c.logger.Debug("Processing packet #%d (size: %d bytes)", c.countSent, n)
 
 		salt := crypto.RandomBytes(8)
