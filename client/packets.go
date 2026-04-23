@@ -26,13 +26,10 @@ func NewPacket(data []byte, logger *logger.Logger) (packet *Packet) {
 }
 
 func (p *Packet) PackageAssembly(serialNumber uint32, salt [8]byte, key []byte) (finallyPacket []byte, err error) {
-	plainPacket := make([]byte, 4+8+len(p.Data)) // serial_number (4 bytes) + salt (8 bytes) + data (n bytes)
-	serialNumberBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(serialNumberBytes, serialNumber)
+	plainPacket := make([]byte, 8+len(p.Data)) // salt (8 bytes) + data (n bytes)
 
-	copy(plainPacket[:4], serialNumberBytes)
-	copy(plainPacket[4:12], salt[:])
-	copy(plainPacket[12:len(p.Data)+12], p.Data)
+	copy(plainPacket[0:8], salt[:])
+	copy(plainPacket[8:len(p.Data)+8], p.Data)
 
 	cipherPacket, nonce, err := crypto.EncryptChaCha20Poly1305(plainPacket, key)
 	if err != nil {
