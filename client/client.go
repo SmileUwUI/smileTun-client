@@ -22,10 +22,12 @@ type Client struct {
 	initPassword [32]byte
 	username     [16]byte
 	password     [16]byte
-	conn         net.Conn
+	conn         *net.TCPConn
 	sessionKey   []byte
 	tunnel       *tunnel.Tunnel
 	logger       *logger.Logger
+	countRecv    uint32
+	countSent    uint32
 }
 
 func NewClient(host string, port int, initPassword [32]byte, username, password [16]byte, logger *logger.Logger) (client *Client, err error) {
@@ -88,7 +90,7 @@ func (c *Client) Run() (err error) {
 		c.logger.Error("Failed to connect to server: %v", err)
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
-	c.conn = conn
+	c.conn = conn.(*net.TCPConn)
 	c.logger.Info("Connected to server successfully")
 
 	timestamp := time.Now().Unix()
@@ -141,6 +143,7 @@ func (c *Client) Run() (err error) {
 	c.logger.Info("Session key derived successfully")
 
 	c.logger.Info("Starting tunnel")
+	c.conn.SetNoDelay(true)
 	c.startTunnel()
 
 	return nil
@@ -155,31 +158,38 @@ func (c *Client) startTunnel() (err error) {
 
 	c.logger.Info("Tunnel %s is up with IP %s", (*c.tunnel).Name(), (*c.tunnel).IP())
 
-	packet := make([]byte, (*c.tunnel).MTU())
-	packetCount := 0
+	rawPacket := make([]byte, (*c.tunnel).MTU())
 
 	c.logger.Info("Starting packet processing loop")
 	for {
-		n, err := (*c.tunnel).Read(packet)
+		n, err := (*c.tunnel).Read(rawPacket)
 
 		if err != nil {
 			c.logger.Error("Failed to read from tunnel: %v", err)
 			return err
 		}
 
-		packetCount++
-		sourceAddress := packet[12:16]
-		destinationAddress := packet[16:20]
+		c.countSent++
+		sourceAddress := rawPacket[12:16]
+		destinationAddress := rawPacket[16:20]
 
-		c.logger.Trace("Packet #%d", packetCount)
+		c.logger.Trace("Packet #%d", c.countSent)
 
 		c.logger.Trace("\tSource: %d.%d.%d.%d", sourceAddress[0], sourceAddress[1], sourceAddress[2], sourceAddress[3])
 		c.logger.Trace("\tDestination: %d.%d.%d.%d", destinationAddress[0], destinationAddress[1], destinationAddress[2], destinationAddress[3])
-		c.logger.Trace("\tProtocol: %d", packet[9])
+		c.logger.Trace("\tProtocol: %d", rawPacket[9])
 
-		c.logger.Debug("Processing packet #%d (size: %d bytes)", packetCount, n)
+		c.logger.Debug("Processing packet #%d (size: %d bytes)", c.countSent, n)
 
-		packet = packet[:n]
+		packet := make([]byte, 4+8+n)
+		serialNumber := make([]byte, 4)
+		binary.BigEndian.PutUint32(serialNumber, c.countSent)
+
+		salt := crypto.RandomBytes(8)
+
+		copy(packet[:4], serialNumber)
+		copy(packet[4:12], salt)
+		copy(packet[12:n+12], packet[:n])
 
 		c.logger.Trace("Encrypting packet with session key")
 		cipherPacket, nonce, err := crypto.EncryptChaCha20Poly1305(packet, c.sessionKey[:])
@@ -189,29 +199,45 @@ func (c *Client) startTunnel() (err error) {
 		}
 		c.logger.Trace("Packet encrypted (cipher size: %d bytes)", len(cipherPacket))
 
-		lenPacketBytes := make([]byte, 2)
-		binary.BigEndian.PutUint16(lenPacketBytes[0:2], uint16(len(nonce)+len(cipherPacket)+2))
+		lenCipherPacketBytes := make([]byte, 2)
+		binary.BigEndian.PutUint16(lenCipherPacketBytes[0:2], uint16(len(nonce)+len(cipherPacket)+2))
 		c.logger.Trace("Total packet size: %d bytes", len(nonce)+len(cipherPacket)+2)
 
-		finallyPacket := make([]byte, len(nonce)+len(cipherPacket)+2)
+		finallyPacket := make([]byte, len(nonce)+len(cipherPacket)+2+2)
+		copy(finallyPacket[4:16], nonce)
+		copy(finallyPacket[16:16+len(cipherPacket)], cipherPacket)
+		finallyPacket = crypto.Trashfication(finallyPacket, 400, 1300)
+		lenPacketBytes := make([]byte, 2)
+		binary.BigEndian.PutUint16(lenPacketBytes[0:2], uint16(len(finallyPacket)))
+
 		finallyPacket[0] = lenPacketBytes[0] ^ c.sessionKey[0]
 		finallyPacket[1] = lenPacketBytes[1] ^ c.sessionKey[1]
+		finallyPacket[2] = lenCipherPacketBytes[0] ^ c.sessionKey[2]
+		finallyPacket[3] = lenCipherPacketBytes[1] ^ c.sessionKey[3]
 
-		copy(finallyPacket[2:14], nonce)
-		copy(finallyPacket[14:14+len(cipherPacket)], cipherPacket)
+		c.logger.Trace("Added trashfication (final size: %d bytes)", len(finallyPacket))
 
-		trashPacket := crypto.Trashfication(finallyPacket, 400, 1300)
-		c.logger.Trace("Added trashfication (final size: %d bytes)", len(trashPacket))
-
-		if _, err := c.conn.Write(trashPacket); err != nil {
+		if _, err := c.conn.Write(finallyPacket); err != nil {
 			c.logger.Error("Failed to send packet to server: %v", err)
 			log.Printf("%v", err)
 		}
 
-		c.logger.Debug("Packet #%d sent to server", packetCount)
+		c.computNextSessionKey(salt)
+
+		c.logger.Debug("Packet #%d sent to server", c.countSent)
+		c.logger.Debug("_________________________")
 	}
 
 	return nil
+}
+
+func (c *Client) computNextSessionKey(salt []byte) {
+	hasher := sha256.New()
+	hasher.Write(c.sessionKey)
+	hasher.Write([]byte(":"))
+	hasher.Write(salt)
+
+	c.sessionKey = hasher.Sum(nil)
 }
 
 type RouteInfo struct {
