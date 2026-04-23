@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os/exec"
 	"smiletun-client/crypto"
@@ -170,56 +169,26 @@ func (c *Client) startTunnel() (err error) {
 		}
 
 		c.countSent++
-		sourceAddress := rawPacket[12:16]
-		destinationAddress := rawPacket[16:20]
+		packet := NewPacket(rawPacket[:n], c.logger)
 
 		c.logger.Trace("Packet #%d", c.countSent)
 
-		c.logger.Trace("\tSource: %d.%d.%d.%d", sourceAddress[0], sourceAddress[1], sourceAddress[2], sourceAddress[3])
-		c.logger.Trace("\tDestination: %d.%d.%d.%d", destinationAddress[0], destinationAddress[1], destinationAddress[2], destinationAddress[3])
-		c.logger.Trace("\tProtocol: %d", rawPacket[9])
+		c.logger.Trace("\tSource: %s", packet.SourceAddress.String())
+		c.logger.Trace("\tDestination: %s", packet.DestinationAddress.String())
 
 		c.logger.Debug("Processing packet #%d (size: %d bytes)", c.countSent, n)
 
-		packet := make([]byte, 4+8+n)
-		serialNumber := make([]byte, 4)
-		binary.BigEndian.PutUint32(serialNumber, c.countSent)
-
 		salt := crypto.RandomBytes(8)
 
-		copy(packet[:4], serialNumber)
-		copy(packet[4:12], salt)
-		copy(packet[12:n+12], packet[:n])
-
-		c.logger.Trace("Encrypting packet with session key")
-		cipherPacket, nonce, err := crypto.EncryptChaCha20Poly1305(packet, c.sessionKey[:])
+		finallyPacket, err := packet.PackageAssembly(c.countSent, [8]byte(salt), c.sessionKey)
 		if err != nil {
-			c.logger.Error("Failed to encrypt packet: %v", err)
-			log.Printf("%v", err)
+			c.logger.Error("Error while building the package: %v", err)
+			continue
 		}
-		c.logger.Trace("Packet encrypted (cipher size: %d bytes)", len(cipherPacket))
-
-		lenCipherPacketBytes := make([]byte, 2)
-		binary.BigEndian.PutUint16(lenCipherPacketBytes[0:2], uint16(len(nonce)+len(cipherPacket)+2))
-		c.logger.Trace("Total packet size: %d bytes", len(nonce)+len(cipherPacket)+2)
-
-		finallyPacket := make([]byte, len(nonce)+len(cipherPacket)+2+2)
-		copy(finallyPacket[4:16], nonce)
-		copy(finallyPacket[16:16+len(cipherPacket)], cipherPacket)
-		finallyPacket = crypto.Trashfication(finallyPacket, 400, 1300)
-		lenPacketBytes := make([]byte, 2)
-		binary.BigEndian.PutUint16(lenPacketBytes[0:2], uint16(len(finallyPacket)))
-
-		finallyPacket[0] = lenPacketBytes[0] ^ c.sessionKey[0]
-		finallyPacket[1] = lenPacketBytes[1] ^ c.sessionKey[1]
-		finallyPacket[2] = lenCipherPacketBytes[0] ^ c.sessionKey[2]
-		finallyPacket[3] = lenCipherPacketBytes[1] ^ c.sessionKey[3]
-
-		c.logger.Trace("Added trashfication (final size: %d bytes)", len(finallyPacket))
 
 		if _, err := c.conn.Write(finallyPacket); err != nil {
 			c.logger.Error("Failed to send packet to server: %v", err)
-			log.Printf("%v", err)
+			continue
 		}
 
 		c.computNextSessionKey(salt)
