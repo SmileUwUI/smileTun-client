@@ -15,17 +15,18 @@ import (
 )
 
 type Client struct {
-	host         string
-	port         int
-	initPassword [32]byte
-	username     [16]byte
-	password     [16]byte
-	conn         *net.TCPConn
-	sessionKey   []byte
-	tunnel       *tunnel.Tunnel
-	logger       *logger.Logger
-	countRecv    uint32
-	countSent    uint32
+	host           string
+	port           int
+	initPassword   [32]byte
+	username       [16]byte
+	password       [16]byte
+	conn           *net.TCPConn
+	sessionSentKey []byte
+	sessionRecvKey []byte
+	tunnel         *tunnel.Tunnel
+	logger         *logger.Logger
+	countRecv      uint32
+	countSent      uint32
 }
 
 func NewClient(host string, port int, initPassword [32]byte, username, password [16]byte, logger *logger.Logger) (client *Client, err error) {
@@ -49,8 +50,6 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 	}
 
 	logger.Debug("Server route added successfully")
-
-	logger.Info("TUN interface created successfully")
 
 	return &Client{
 		host:         host,
@@ -117,14 +116,21 @@ func (c *Client) Run() (err error) {
 	c.logger.Debug("Salt decrypted successfully")
 
 	c.logger.Debug("Deriving session key from password and salt")
-	sessionKeyHasher := sha256.New()
-	sessionKeyHasher.Write(c.password[:])
-	sessionKeyHasher.Write([]byte(":"))
-	sessionKeyHasher.Write(salt)
+	sessionSentKeyHasher := sha256.New()
+	sessionSentKeyHasher.Write(c.password[:])
+	sessionSentKeyHasher.Write([]byte(":"))
+	sessionSentKeyHasher.Write(salt[0:16])
 
-	c.sessionKey = sessionKeyHasher.Sum(nil)
+	c.sessionSentKey = sessionSentKeyHasher.Sum(nil)
 
-	cipherOkPacket, nonce, _ := crypto.EncryptChaCha20Poly1305([]byte{0xFF}, c.sessionKey)
+	sessionRecvKeyHasher := sha256.New()
+	sessionRecvKeyHasher.Write(c.password[:])
+	sessionRecvKeyHasher.Write([]byte(":"))
+	sessionRecvKeyHasher.Write(salt[16:32])
+
+	c.sessionRecvKey = sessionRecvKeyHasher.Sum(nil)
+
+	cipherOkPacket, nonce, _ := crypto.EncryptChaCha20Poly1305([]byte{0xFF}, c.sessionSentKey)
 
 	okPacket := make([]byte, len(cipherOkPacket)+len(nonce))
 	copy(okPacket[:12], nonce)
@@ -138,9 +144,9 @@ func (c *Client) Run() (err error) {
 	}
 	ipPacket = ipPacket[:32]
 
-	ip, err := crypto.DecryptChaCha20Poly1305(ipPacket[12:], ipPacket[:12], c.sessionKey)
+	ip, err := crypto.DecryptChaCha20Poly1305(ipPacket[12:], ipPacket[:12], c.sessionRecvKey)
 	if err != nil {
-		c.logger.Error("Failed to decrypt salt packet: %v", err)
+		c.logger.Error("Failed to decrypt ip packet: %v", err)
 		return
 	}
 
@@ -155,12 +161,19 @@ func (c *Client) Run() (err error) {
 		},
 	)
 
+	err = tun.Up()
+	if err != nil {
+		c.logger.Error("Failed to up tunnel: %v", err)
+		return err
+	}
+
 	if err != nil {
 		c.logger.Error("Failed to create tunnel: %v", err)
 		return fmt.Errorf("error create tunnel: %v", err)
 	}
 
 	c.tunnel = &tun
+	c.logger.Info("TUN interface created successfully")
 
 	c.logger.Info("Session key derived successfully")
 
@@ -179,16 +192,31 @@ func (c *Client) startTunnel() (err error) {
 
 	c.logger.Info("Tunnel %s is up with IP %s", (*c.tunnel).Name(), (*c.tunnel).IP())
 
-	rawPacket := make([]byte, (*c.tunnel).MTU())
+	headerInfo := make([]byte, 4)
 
 	c.logger.Info("Starting packet processing loop")
 	for {
-		n, err := (*c.tunnel).Read(rawPacket)
-
+		_, err := (*c.tunnel).Read(headerInfo)
 		if err != nil {
 			c.logger.Error("Failed to read from tunnel: %v", err)
 			return err
 		}
+
+		if headerInfo[0]>>4 != 0x04 {
+			continue
+		}
+
+		headerLength := binary.BigEndian.Uint16(headerInfo[2:4])
+		remainingPacket := make([]byte, headerLength-4)
+		n, err := (*c.tunnel).Read(remainingPacket)
+		if err != nil {
+			c.logger.Error("Failed to read from tunnel: %v", err)
+			return err
+		}
+
+		rawPacket := make([]byte, (*c.tunnel).MTU())
+		copy(rawPacket[:4], headerInfo)
+		copy(rawPacket[4:headerLength], remainingPacket)
 
 		c.countSent++
 		packet := NewPacket(rawPacket[:n], c.logger)
@@ -200,7 +228,7 @@ func (c *Client) startTunnel() (err error) {
 
 		salt := crypto.RandomBytes(8)
 
-		finallyPacket, err := packet.PackageAssembly(c.countSent, [8]byte(salt), c.sessionKey)
+		finallyPacket, err := packet.PackageAssembly(c.countSent, [8]byte(salt), c.sessionSentKey)
 		if err != nil {
 			c.logger.Error("Error while building the package: %v", err)
 			continue
@@ -211,7 +239,7 @@ func (c *Client) startTunnel() (err error) {
 			continue
 		}
 
-		c.computNextSessionKey(salt)
+		c.computNextSessionSentKey(salt)
 
 		c.logger.Debug("Packet #%d sent to server", c.countSent)
 		c.logger.Debug("_________________________")
@@ -220,13 +248,13 @@ func (c *Client) startTunnel() (err error) {
 	return nil
 }
 
-func (c *Client) computNextSessionKey(salt []byte) {
+func (c *Client) computNextSessionSentKey(salt []byte) {
 	hasher := sha256.New()
-	hasher.Write(c.sessionKey)
+	hasher.Write(c.sessionSentKey)
 	hasher.Write([]byte(":"))
 	hasher.Write(salt)
 
-	c.sessionKey = hasher.Sum(nil)
+	c.sessionSentKey = hasher.Sum(nil)
 }
 
 type RouteInfo struct {
