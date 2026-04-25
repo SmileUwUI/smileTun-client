@@ -13,7 +13,7 @@ func RandomBytes(lengthOutput int) (output []byte) {
 	binary.BigEndian.PutUint64(rawSeed, uint64(time.Now().UnixNano()))
 
 	seedHash := sha256.New()
-	seedHash.Sum(rawSeed)
+	seedHash.Write(rawSeed)
 
 	generator := mathRand.NewChaCha8([32]byte(seedHash.Sum(nil)))
 	output = make([]byte, lengthOutput)
