@@ -4,23 +4,26 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/songgao/water"
 )
 
 type LinuxTunnel struct {
-	iface   *water.Interface
-	name    string
-	ip      net.IP
-	netmask net.IPMask
-	mtu     int
-	running bool
-	mu      sync.RWMutex
-	stats   TunnelStats
+	iface    *water.Interface
+	name     string
+	ip       net.IP
+	netmask  net.IPMask
+	mtu      int
+	running  bool
+	mu       sync.RWMutex
+	stats    TunnelStats
+	oldGW    string
+	oldIface string
 }
 
-func NewTunnel(name string, mtu int, address net.IP, netmask net.IPMask, routes []*net.IPNet) (Tunnel, error) {
+func NewTunnel(name string, mtu int, address net.IP, netmask net.IPMask) (Tunnel, error) {
 	waterConfig := water.Config{
 		DeviceType: water.TUN,
 	}
@@ -116,21 +119,109 @@ func (t *LinuxTunnel) SetMTU(mtu int) error {
 	return nil
 }
 
+func (t *LinuxTunnel) saveDefaultRoute() error {
+	cmd := exec.Command("ip", "route", "show", "default")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	parts := strings.Fields(string(output))
+	for i, part := range parts {
+		if part == "via" && i+1 < len(parts) {
+			t.oldGW = parts[i+1]
+		}
+		if part == "dev" && i+1 < len(parts) {
+			t.oldIface = parts[i+1]
+		}
+	}
+
+	return nil
+}
+
+func (t *LinuxTunnel) restoreDefaultRoute() error {
+	exec.Command("ip", "route", "del", "default").Run()
+
+	if t.oldGW != "" && t.oldIface != "" {
+		cmd := exec.Command("ip", "route", "add", "default", "via", t.oldGW, "dev", t.oldIface)
+		return cmd.Run()
+	}
+
+	return nil
+}
+
+func (t *LinuxTunnel) SetupDefaultRoute() error {
+	if err := t.saveDefaultRoute(); err != nil {
+		return err
+	}
+
+	exec.Command("ip", "route", "del", "default").Run()
+
+	cmd := exec.Command("ip", "route", "add", "default", "dev", t.name)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to set default route to TUN: %w", err)
+	}
+
+	fmt.Printf("Default route changed to dev %s\n", t.name)
+	return nil
+}
+
+func (t *LinuxTunnel) AddRoutes(routes []*net.IPNet) error {
+	for _, route := range routes {
+		if route == nil {
+			continue
+		}
+
+		exec.Command("ip", "route", "del", route.String()).Run()
+
+		cmd := exec.Command("ip", "route", "add", route.String(), "dev", t.name)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to add route %s: %w", route.String(), err)
+		}
+
+		fmt.Printf("Route added: %s dev %s\n", route.String(), t.name)
+	}
+	return nil
+}
+
+func (t *LinuxTunnel) DeleteRoutes(routes []*net.IPNet) error {
+	for _, route := range routes {
+		if route == nil {
+			continue
+		}
+
+		exec.Command("ip", "route", "del", route.String(), "dev", t.name).Run()
+	}
+	return nil
+}
+
 func (t *LinuxTunnel) Up() error {
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "up")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to bring up interface: %w", err)
 	}
+
+	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+
+	if err := t.SetupDefaultRoute(); err != nil {
+		return err
+	}
+
 	t.running = true
+	fmt.Printf("TUN interface %s is UP with IP %s\n", t.name, t.ip)
 	return nil
 }
 
 func (t *LinuxTunnel) Down() error {
+	t.restoreDefaultRoute()
+
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "down")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to bring down interface: %w", err)
 	}
+
 	t.running = false
+	fmt.Printf("TUN interface %s is DOWN, routes restored\n", t.name)
 	return nil
 }
 
