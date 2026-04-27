@@ -132,7 +132,7 @@ func (c *Client) Run() (err error) {
 	okPacket := NewPlainPacket()
 	okPacket.AddData([]byte{0xFF})
 
-	curve := ecdh.P256()
+	curve := ecdh.X25519()
 	c.logger.Debug("Generating a keypair for ECDH")
 	privateClientKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
@@ -154,6 +154,9 @@ func (c *Client) Run() (err error) {
 	c.logger.Trace("Reading a packet containing an IP address ")
 	if err != nil {
 		c.logger.Error("Error reading the packet with IP address: %v", err)
+		if err.Error() == "EOF" {
+			return
+		}
 		return err
 	}
 
@@ -218,6 +221,7 @@ func (c *Client) writerTunnel() {
 			if err != nil {
 				c.logger.Error("Failed to read packet: %v", err)
 				if err.Error() == "EOF" {
+					c.Stop()
 					return
 				}
 				continue
@@ -309,7 +313,6 @@ func (c *Client) computeNextSessionRecvKey(salt []byte) {
 func (c *Client) readPacket() (packet *StreamingPacket, err error) {
 	lenPacketBytes, err := c.read(2)
 	if err != nil {
-		c.logger.Error("%v", err)
 		return nil, err
 	}
 
