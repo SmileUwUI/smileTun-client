@@ -1,27 +1,14 @@
 package crypto
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
+	cryptoRand "crypto/rand"
 	"math/rand"
-	mathRand "math/rand/v2"
-	"time"
 )
 
-func RandomBytes(lengthOutput int) (output []byte) {
-	rawSeed := make([]byte, 8)
-	binary.BigEndian.PutUint64(rawSeed, uint64(time.Now().UnixNano()))
-
-	seedHash := sha256.New()
-	seedHash.Write(rawSeed)
-
-	generator := mathRand.NewChaCha8([32]byte(seedHash.Sum(nil)))
-	output = make([]byte, lengthOutput)
-	for i := range output {
-		output[i] = byte(generator.Uint64() % 256)
-	}
-
-	return output
+func RandomBytes(lengthOutput int) ([]byte, error) {
+	output := make([]byte, lengthOutput)
+	_, err := cryptoRand.Read(output)
+	return output, err
 }
 
 func Trashfication(source []byte, minLength, maxLength int) (result []byte) {

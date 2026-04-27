@@ -12,7 +12,10 @@ func EncryptChaCha20Poly1305(plainText, key []byte) (cipherText, nonce []byte, e
 		return nil, nil, fmt.Errorf("encryption error: %v", err)
 	}
 
-	nonce = RandomBytes(chacha20poly1305.NonceSize)
+	nonce, err = RandomBytes(chacha20poly1305.NonceSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("")
+	}
 
 	cipherText = aead.Seal(nil, nonce, plainText, nil)
 
