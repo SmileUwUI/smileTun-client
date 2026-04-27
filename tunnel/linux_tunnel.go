@@ -162,7 +162,6 @@ func (t *LinuxTunnel) SetupDefaultRoute() error {
 		return fmt.Errorf("failed to set default route to TUN: %w", err)
 	}
 
-	fmt.Printf("Default route changed to dev %s\n", t.name)
 	return nil
 }
 
@@ -179,7 +178,6 @@ func (t *LinuxTunnel) AddRoutes(routes []*net.IPNet) error {
 			return fmt.Errorf("failed to add route %s: %w", route.String(), err)
 		}
 
-		fmt.Printf("Route added: %s dev %s\n", route.String(), t.name)
 	}
 	return nil
 }
@@ -208,7 +206,6 @@ func (t *LinuxTunnel) Up() error {
 	}
 
 	t.running = true
-	fmt.Printf("TUN interface %s is UP with IP %s\n", t.name, t.ip)
 	return nil
 }
 
@@ -221,7 +218,6 @@ func (t *LinuxTunnel) Down() error {
 	}
 
 	t.running = false
-	fmt.Printf("TUN interface %s is DOWN, routes restored\n", t.name)
 	return nil
 }
 
