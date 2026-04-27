@@ -34,7 +34,7 @@ func NewRawPacket() (packet *StreamingPacket) {
 	}
 }
 
-func (s *StreamingPacket) AddData(data []byte) error {
+func (s *StreamingPacket) AddData(data []byte) {
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 
@@ -42,11 +42,7 @@ func (s *StreamingPacket) AddData(data []byte) error {
 		s.plainData = append(s.plainData, dataCopy...)
 	} else if s.typePacket == RawPacket {
 		s.rawData = append(s.rawData, dataCopy...)
-	} else {
-		return errors.New("unknown packet type")
 	}
-
-	return nil
 }
 
 func (s *StreamingPacket) PackageAssembly(key, salt []byte) (err error) {

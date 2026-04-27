@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"net"
 	"os/exec"
 	"smiletun-client/crypto"
 	"smiletun-client/logger"
 	"smiletun-client/tunnel"
+	"sync"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -27,6 +29,8 @@ type Client struct {
 	logger         *logger.Logger
 	countRecv      uint32
 	countSent      uint32
+	hasher         hash.Hash
+	hasherLock     sync.Mutex
 
 	stopCh chan struct{}
 }
@@ -53,6 +57,7 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 		username:     username,
 		password:     password,
 		logger:       logger,
+		hasher:       sha256.New(),
 		stopCh:       make(chan struct{}),
 	}, nil
 }
@@ -109,18 +114,18 @@ func (c *Client) Run() (err error) {
 	}
 
 	c.logger.Trace("Calculating the send key")
-	sessionSentKeyHasher := sha256.New()
-	sessionSentKeyHasher.Write(c.password[:])
-	sessionSentKeyHasher.Write([]byte(":"))
-	sessionSentKeyHasher.Write(saltPacket.GetPlainData()[0:16])
-	c.sessionSentKey = sessionSentKeyHasher.Sum(nil)
+	c.hasher.Reset()
+	c.hasher.Write(c.password[:])
+	c.hasher.Write([]byte(":"))
+	c.hasher.Write(saltPacket.GetPlainData()[0:16])
+	c.sessionSentKey = c.hasher.Sum(nil)
 
 	c.logger.Trace("Calculating the recv key")
-	sessionRecvKeyHasher := sha256.New()
-	sessionRecvKeyHasher.Write(c.password[:])
-	sessionRecvKeyHasher.Write([]byte(":"))
-	sessionRecvKeyHasher.Write(saltPacket.GetPlainData()[16:32])
-	c.sessionRecvKey = sessionRecvKeyHasher.Sum(nil)
+	c.hasher.Reset()
+	c.hasher.Write(c.password[:])
+	c.hasher.Write([]byte(":"))
+	c.hasher.Write(saltPacket.GetPlainData()[16:32])
+	c.sessionRecvKey = c.hasher.Sum(nil)
 
 	okPacket := NewPlainPacket()
 	okPacket.AddData([]byte{0xFF})
@@ -159,8 +164,8 @@ func (c *Client) Run() (err error) {
 	c.tunnel = &tun
 
 	c.logger.Debug("Launch the goroutine to read the tunnel and send packets to the server")
-	go c.startTunnel()
-	c.logger.Debug("Launch the goroutine to read the tunnel and send packets to the server")
+	go c.readerTunnel()
+	c.logger.Debug("A daemon has been launched to read packets from the server and write them to the tunnel")
 	go c.writerTunnel()
 
 	return nil
@@ -193,7 +198,7 @@ func (c *Client) writerTunnel() {
 				continue
 			}
 
-			c.logger.Debug("Send packet #%d through the tunnel", c.countRecv)
+			c.logger.Trace("Send packet #%d through the tunnel", c.countRecv)
 			_, err = (*c.tunnel).Write(packet.GetPlainData())
 			if err != nil {
 				c.logger.Error("Failed to write packet in tun: %v", err)
@@ -204,7 +209,7 @@ func (c *Client) writerTunnel() {
 	}
 }
 
-func (c *Client) startTunnel() {
+func (c *Client) readerTunnel() {
 	if err := (*c.tunnel).Up(); err != nil {
 		c.logger.Error("Failed to bring TUN interface up: %v", err)
 		return
@@ -250,21 +255,23 @@ func (c *Client) startTunnel() {
 }
 
 func (c *Client) computNextSessionSentKey(salt []byte) {
-	hasher := sha256.New()
-	hasher.Write(c.sessionSentKey)
-	hasher.Write([]byte(":"))
-	hasher.Write(salt)
-
-	c.sessionSentKey = hasher.Sum(nil)
+	c.hasherLock.Lock()
+	defer c.hasherLock.Unlock()
+	c.hasher.Reset()
+	c.hasher.Write(c.sessionSentKey)
+	c.hasher.Write([]byte(":"))
+	c.hasher.Write(salt)
+	c.sessionSentKey = c.hasher.Sum(nil)
 }
 
 func (c *Client) computNextSessionRecvKey(salt []byte) {
-	hasher := sha256.New()
-	hasher.Write(c.sessionRecvKey)
-	hasher.Write([]byte(":"))
-	hasher.Write(salt)
-
-	c.sessionRecvKey = hasher.Sum(nil)
+	c.hasherLock.Lock()
+	defer c.hasherLock.Unlock()
+	c.hasher.Reset()
+	c.hasher.Write(c.sessionRecvKey)
+	c.hasher.Write([]byte(":"))
+	c.hasher.Write(salt)
+	c.sessionRecvKey = c.hasher.Sum(nil)
 }
 
 func (c *Client) readPacket() (packet *StreamingPacket, err error) {
