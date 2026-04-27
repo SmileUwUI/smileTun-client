@@ -19,6 +19,7 @@ type StreamingPacket struct {
 	rawData    []byte
 	plainData  []byte
 	cipherData []byte
+	publicKey  []byte
 	fakeFlag   bool
 	ecdhFlag   bool
 	typePacket TypePacket
@@ -51,26 +52,31 @@ func (s *StreamingPacket) AddData(data []byte) {
 	}
 }
 
-func (s *StreamingPacket) PackageAssembly(key, salt []byte, fake bool) (err error) {
+func (s *StreamingPacket) PackageAssembly(key, salt, publicKey []byte, fake, ecdh bool) (err error) {
 	if s.typePacket != PlainPacket {
 		return errors.New("this operation is available only for the PlainPacket package type")
 	}
-	s.fakeFlag = fake
 
+	s.fakeFlag = fake
+	s.ecdhFlag = ecdh
+	s.publicKey = publicKey
 	s.salt = salt
 	var nonce []byte
-	plainDataWithSalt := make([]byte, len(s.plainData)+len(salt))
-	copy(plainDataWithSalt[:len(salt)], salt)
-	copy(plainDataWithSalt[len(salt):], s.plainData)
+	plainData := make([]byte, len(s.plainData)+len(salt)+len(s.publicKey))
+	copy(plainData[:len(salt)], salt)
+	if s.ecdhFlag {
+		copy(plainData[len(salt):len(salt)+len(s.publicKey)], s.publicKey)
+	}
+	copy(plainData[len(salt)+len(s.publicKey):], s.plainData)
 
-	s.cipherData, nonce, err = crypto.EncryptChaCha20Poly1305(plainDataWithSalt, key)
+	s.cipherData, nonce, err = crypto.EncryptChaCha20Poly1305(plainData, key)
 	if err != nil {
 		return fmt.Errorf("packet decryption error: %v", err)
 	}
 
 	s.rawData = make([]byte, len(s.cipherData)+len(nonce)+2+2+1) // size CipherData + size Nonce + size length RawData + size length CipherData + size flags byte
 
-	binary.BigEndian.PutUint16(s.rawData[3:5], uint16(len(s.cipherData)+len(nonce)+2+1))
+	binary.BigEndian.PutUint16(s.rawData[3:5], uint16(len(s.cipherData)+len(nonce)+2))
 	copy(s.rawData[5:17], nonce)
 	copy(s.rawData[17:], s.cipherData)
 
@@ -82,6 +88,9 @@ func (s *StreamingPacket) PackageAssembly(key, salt []byte, fake bool) (err erro
 	flags := flagsBytes[0] & 0b11111100
 	if s.fakeFlag {
 		flags = flags | 0b00000001
+	}
+	if s.ecdhFlag {
+		flags = flags | 0b00000010
 	}
 
 	s.rawData[0] = s.rawData[0] ^ key[0]
@@ -117,10 +126,16 @@ func (s *StreamingPacket) DecodeAndDecrypt(key []byte, withSalt bool) (err error
 		return fmt.Errorf("packet encryption error: %v", err)
 	}
 
+	offsetPlainData := 0
 	if withSalt {
 		s.salt = s.plainData[:8]
-		s.plainData = s.plainData[8:]
+		offsetPlainData += 8
 	}
+	if s.ecdhFlag {
+		s.publicKey = s.plainData[offsetPlainData : offsetPlainData+32]
+		offsetPlainData += 32
+	}
+	s.plainData = s.plainData[offsetPlainData:]
 
 	return nil
 }
@@ -135,4 +150,12 @@ func (s *StreamingPacket) GetPlainData() (data []byte) {
 
 func (s *StreamingPacket) GetSalt() (salt []byte) {
 	return s.salt
+}
+
+func (s *StreamingPacket) GetPublicKey() (publicLey []byte) {
+	return s.publicKey
+}
+
+func (s *StreamingPacket) GetEcdhFlag() (ecdhFlag bool) {
+	return s.ecdhFlag
 }

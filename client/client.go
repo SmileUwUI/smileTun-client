@@ -19,20 +19,22 @@ import (
 )
 
 type Client struct {
-	host           string
-	port           int
-	initPassword   [32]byte
-	username       [16]byte
-	password       [16]byte
-	conn           *net.TCPConn
-	sessionSentKey []byte
-	sessionRecvKey []byte
-	tunnel         *tunnel.Tunnel
-	logger         *logger.Logger
-	countRecv      uint32
-	countSent      uint32
-	hasher         hash.Hash
-	hasherLock     sync.Mutex
+	host                     string
+	port                     int
+	initPassword             [32]byte
+	username                 [16]byte
+	password                 [16]byte
+	conn                     *net.TCPConn
+	sessionSentKey           []byte
+	sessionRecvKey           []byte
+	secretECDH               []byte
+	tunnel                   *tunnel.Tunnel
+	logger                   *logger.Logger
+	countRecv                uint32
+	countSent                uint32
+	ephemeralPublicClientKey *ecdh.PublicKey
+	hasher                   hash.Hash
+	hasherLock               sync.Mutex
 
 	stopCh chan struct{}
 }
@@ -89,7 +91,7 @@ func (c *Client) Run() (err error) {
 	packet.AddData(timestampBytes)
 
 	c.logger.Trace("Assembly a packet with a username")
-	err = packet.PackageAssembly(c.initPassword[:], []byte{}, false)
+	err = packet.PackageAssembly(c.initPassword[:], []byte{}, []byte{}, false, false)
 	if err != nil {
 		c.logger.Error("An error occurred while creating the packet with the username: %v", err)
 		return err
@@ -140,10 +142,9 @@ func (c *Client) Run() (err error) {
 		return err
 	}
 	publicClientKey := privateClientKey.PublicKey()
-	okPacket.AddData(publicClientKey.Bytes())
 
 	c.logger.Trace("Assembly the packet with connection establishment confirmation ")
-	okPacket.PackageAssembly(c.sessionSentKey, []byte{}, false)
+	okPacket.PackageAssembly(c.sessionSentKey, []byte{}, publicClientKey.Bytes(), false, true)
 	c.logger.Trace("Sending a packet confirming that the connection has been established ")
 	if _, err = c.conn.Write(okPacket.GetRawData()); err != nil {
 		c.logger.Error("Error sending the connection establishment acknowledgment packet: %v", err)
@@ -168,7 +169,7 @@ func (c *Client) Run() (err error) {
 
 	ip := ipPacket.GetPlainData()
 	c.logger.Debug("Parsing the server's public key")
-	publicServerKey, err := curve.NewPublicKey(ipPacket.GetPlainData()[4:])
+	publicServerKey, err := curve.NewPublicKey(ipPacket.GetPublicKey())
 	if err != nil {
 		c.logger.Error("Error parsing the server's public key: %v", err)
 		return err
@@ -211,6 +212,7 @@ func (c *Client) Stop() {
 }
 
 func (c *Client) writerTunnel() {
+	var secret []byte
 	for {
 		select {
 		case <-c.stopCh:
@@ -241,6 +243,34 @@ func (c *Client) writerTunnel() {
 			}
 
 			c.computeNextSessionRecvKey(packet.GetSalt())
+
+			if packet.GetEcdhFlag() {
+				c.logger.Debug("A new round of the ECDH has begun")
+
+				var publicServerKey *ecdh.PublicKey
+				curve := ecdh.X25519()
+				publicServerKey, err = curve.NewPublicKey(packet.GetPublicKey())
+				if err != nil {
+					c.logger.Error("Error parsing the server's public key: %v", err)
+					continue
+				}
+
+				privateKey, err := curve.GenerateKey(rand.Reader)
+				if err != nil {
+					c.logger.Error("Error generating the keypair: %v", err)
+					continue
+				}
+
+				secret, err = privateKey.ECDH(publicServerKey)
+				if err != nil {
+					c.logger.Error("ECDH execution error: %v", err)
+					return
+				}
+				c.ephemeralPublicClientKey = privateKey.PublicKey()
+				c.secretECDH = secret
+				c.countRecv = 0
+				c.computeNextSessionRecvKey(c.secretECDH)
+			}
 		}
 	}
 }
@@ -271,8 +301,12 @@ func (c *Client) readerTunnel() {
 
 			salt, err := crypto.RandomBytes(8)
 			packet.AddData(rawPacket[:n])
-
-			err = packet.PackageAssembly(c.sessionSentKey, salt, false)
+			if c.ephemeralPublicClientKey != nil {
+				err = packet.PackageAssembly(c.sessionSentKey, salt, c.ephemeralPublicClientKey.Bytes(), false, true)
+				c.ephemeralPublicClientKey = nil
+			} else {
+				err = packet.PackageAssembly(c.sessionSentKey, salt, []byte{}, false, false)
+			}
 			if err != nil {
 				c.logger.Error("Error while building the package: %v", err)
 				continue
@@ -285,7 +319,10 @@ func (c *Client) readerTunnel() {
 			}
 
 			c.computeNextSessionSentKey(salt)
-
+			if packet.GetEcdhFlag() {
+				c.countSent = 0
+				c.computeNextSessionSentKey(c.secretECDH)
+			}
 		}
 	}
 }
