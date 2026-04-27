@@ -65,6 +65,8 @@ func (c *Client) Run() (err error) {
 		c.logger.Error("Failed to connect to server: %v", err)
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
+	c.logger.Trace("The connection was established successfully")
+
 	c.conn = conn.(*net.TCPConn)
 	c.conn.SetNoDelay(true)
 
@@ -79,48 +81,60 @@ func (c *Client) Run() (err error) {
 	packet.AddData(c.username[:])
 	packet.AddData(timestampBytes)
 
-	packet.PackageAssembly(c.initPassword[:], []byte{})
+	c.logger.Trace("Assembly a packet with a username")
+	err = packet.PackageAssembly(c.initPassword[:], []byte{})
+	if err != nil {
+		c.logger.Error("An error occurred while creating the packet with the username: %v", err)
+		return err
+	}
+
+	c.logger.Trace("Sending a packet containing username")
 	if _, err = c.conn.Write(packet.GetRawData()); err != nil {
 		c.logger.Error("Error sending a packet with username: %v", err)
 		return err
 	}
 
+	c.logger.Trace("Reading the salt packet")
 	saltPacket, err := c.readPacket()
 	if err != nil {
 		c.logger.Error("Error reading the salt packet: %v", err)
 		return err
 	}
 
+	c.logger.Trace("Packet decoding and decryption")
 	err = saltPacket.DecodeAndDecrypt(c.initPassword[:], false)
 	if err != nil {
 		c.logger.Error("Error decoding and decrypting a salted packet: %v", err)
 		return err
 	}
 
+	c.logger.Trace("Calculating the send key")
 	sessionSentKeyHasher := sha256.New()
 	sessionSentKeyHasher.Write(c.password[:])
 	sessionSentKeyHasher.Write([]byte(":"))
 	sessionSentKeyHasher.Write(saltPacket.GetPlainData()[0:16])
-
 	c.sessionSentKey = sessionSentKeyHasher.Sum(nil)
 
+	c.logger.Trace("Calculating the recv key")
 	sessionRecvKeyHasher := sha256.New()
 	sessionRecvKeyHasher.Write(c.password[:])
 	sessionRecvKeyHasher.Write([]byte(":"))
 	sessionRecvKeyHasher.Write(saltPacket.GetPlainData()[16:32])
-
 	c.sessionRecvKey = sessionRecvKeyHasher.Sum(nil)
 
 	okPacket := NewPlainPacket()
 	okPacket.AddData([]byte{0xFF})
 
+	c.logger.Trace("Assembly the packet with connection establishment confirmation ")
 	okPacket.PackageAssembly(c.sessionSentKey, []byte{})
+	c.logger.Trace("Sending a packet confirming that the connection has been established ")
 	if _, err = c.conn.Write(okPacket.GetRawData()); err != nil {
 		c.logger.Error("Error sending the connection establishment acknowledgment packet: %v", err)
 		return err
 	}
 
 	ipPacket, err := c.readPacket()
+	c.logger.Trace("Reading a packet containing an IP address ")
 	if err != nil {
 		c.logger.Error("Error reading the packet with IP address: %v", err)
 		return err
@@ -129,6 +143,7 @@ func (c *Client) Run() (err error) {
 
 	ip := ipPacket.GetPlainData()
 
+	c.logger.Debug("Creating a TUN interface")
 	tun, err := tunnel.NewTunnel(
 		"smile-tun0",
 		1500,
@@ -141,15 +156,11 @@ func (c *Client) Run() (err error) {
 		return fmt.Errorf("error create tunnel: %v", err)
 	}
 
-	err = tun.Up()
-	if err != nil {
-		c.logger.Error("Failed to up tunnel: %v", err)
-		return err
-	}
-
 	c.tunnel = &tun
 
+	c.logger.Debug("Launch the goroutine to read the tunnel and send packets to the server")
 	go c.startTunnel()
+	c.logger.Debug("Launch the goroutine to read the tunnel and send packets to the server")
 	go c.writerTunnel()
 
 	return nil
@@ -165,8 +176,8 @@ func (c *Client) writerTunnel() {
 		case <-c.stopCh:
 			return
 		default:
+			c.logger.Trace("Reading a packet from socket #%d", c.countRecv)
 			packet, err := c.readPacket()
-			c.countRecv++
 			if err != nil {
 				c.logger.Error("Failed to read packet: %v", err)
 				if err.Error() == "EOF" {
@@ -174,6 +185,7 @@ func (c *Client) writerTunnel() {
 				}
 				continue
 			}
+			c.countRecv++
 
 			err = packet.DecodeAndDecrypt(c.sessionRecvKey, true)
 			if err != nil {
@@ -181,8 +193,8 @@ func (c *Client) writerTunnel() {
 				continue
 			}
 
+			c.logger.Debug("Send packet #%d through the tunnel", c.countRecv)
 			_, err = (*c.tunnel).Write(packet.GetPlainData())
-
 			if err != nil {
 				c.logger.Error("Failed to write packet in tun: %v", err)
 			}
@@ -190,6 +202,69 @@ func (c *Client) writerTunnel() {
 			c.computNextSessionRecvKey(packet.GetSalt())
 		}
 	}
+}
+
+func (c *Client) startTunnel() {
+	if err := (*c.tunnel).Up(); err != nil {
+		c.logger.Error("Failed to bring TUN interface up: %v", err)
+		return
+	}
+	defer (*c.tunnel).Down()
+
+	rawPacket := make([]byte, (*c.tunnel).MTU())
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+			c.logger.Trace("Read packet from tunnel #%d", c.countSent)
+			n, err := (*c.tunnel).Read(rawPacket)
+			if err != nil {
+				c.logger.Error("Failed to read from tunnel: %v", err)
+				return
+			}
+			c.countSent++
+
+			packet := NewPlainPacket()
+
+			salt, err := crypto.RandomBytes(8)
+			packet.AddData(rawPacket[:n])
+
+			err = packet.PackageAssembly(c.sessionSentKey, salt)
+			if err != nil {
+				c.logger.Error("Error while building the package: %v", err)
+				continue
+			}
+
+			c.logger.Trace("Sending a packet to server number #%d", c.countSent)
+			if _, err := c.conn.Write(packet.GetRawData()); err != nil {
+				c.logger.Error("Failed to send packet to server: %v", err)
+				continue
+			}
+
+			c.computNextSessionSentKey(salt)
+
+		}
+	}
+}
+
+func (c *Client) computNextSessionSentKey(salt []byte) {
+	hasher := sha256.New()
+	hasher.Write(c.sessionSentKey)
+	hasher.Write([]byte(":"))
+	hasher.Write(salt)
+
+	c.sessionSentKey = hasher.Sum(nil)
+}
+
+func (c *Client) computNextSessionRecvKey(salt []byte) {
+	hasher := sha256.New()
+	hasher.Write(c.sessionRecvKey)
+	hasher.Write([]byte(":"))
+	hasher.Write(salt)
+
+	c.sessionRecvKey = hasher.Sum(nil)
 }
 
 func (c *Client) readPacket() (packet *StreamingPacket, err error) {
@@ -234,68 +309,6 @@ func (c *Client) read(length uint16) (data []byte, err error) {
 	}
 
 	return data, nil
-}
-
-func (c *Client) startTunnel() {
-	if err := (*c.tunnel).Up(); err != nil {
-		c.logger.Error("Failed to bring TUN interface up: %v", err)
-		return
-	}
-	defer (*c.tunnel).Down()
-
-	rawPacket := make([]byte, (*c.tunnel).MTU())
-
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		default:
-			n, err := (*c.tunnel).Read(rawPacket)
-			if err != nil {
-				c.logger.Error("Failed to read from tunnel: %v", err)
-				return
-			}
-
-			c.countSent++
-
-			packet := NewPlainPacket()
-
-			salt := crypto.RandomBytes(8)
-			packet.AddData(rawPacket[:n])
-
-			err = packet.PackageAssembly(c.sessionSentKey, salt)
-			if err != nil {
-				c.logger.Error("Error while building the package: %v", err)
-				continue
-			}
-
-			if _, err := c.conn.Write(packet.GetRawData()); err != nil {
-				c.logger.Error("Failed to send packet to server: %v", err)
-				continue
-			}
-
-			c.computNextSessionSentKey(salt)
-
-		}
-	}
-}
-
-func (c *Client) computNextSessionSentKey(salt []byte) {
-	hasher := sha256.New()
-	hasher.Write(c.sessionSentKey)
-	hasher.Write([]byte(":"))
-	hasher.Write(salt)
-
-	c.sessionSentKey = hasher.Sum(nil)
-}
-
-func (c *Client) computNextSessionRecvKey(salt []byte) {
-	hasher := sha256.New()
-	hasher.Write(c.sessionRecvKey)
-	hasher.Write([]byte(":"))
-	hasher.Write(salt)
-
-	c.sessionRecvKey = hasher.Sum(nil)
 }
 
 type RouteInfo struct {
