@@ -1,6 +1,8 @@
 package client
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -130,6 +132,16 @@ func (c *Client) Run() (err error) {
 	okPacket := NewPlainPacket()
 	okPacket.AddData([]byte{0xFF})
 
+	curve := ecdh.P256()
+	c.logger.Debug("Generating a keypair for ECDH")
+	privateClientKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		c.logger.Error("Error generating the keypair")
+		return err
+	}
+	publicClientKey := privateClientKey.PublicKey()
+	okPacket.AddData(publicClientKey.Bytes())
+
 	c.logger.Trace("Assembly the packet with connection establishment confirmation ")
 	okPacket.PackageAssembly(c.sessionSentKey, []byte{})
 	c.logger.Trace("Sending a packet confirming that the connection has been established ")
@@ -144,9 +156,29 @@ func (c *Client) Run() (err error) {
 		c.logger.Error("Error reading the packet with IP address: %v", err)
 		return err
 	}
-	ipPacket.DecodeAndDecrypt(c.sessionRecvKey, false)
+
+	err = ipPacket.DecodeAndDecrypt(c.sessionRecvKey, false)
+	if err != nil {
+		c.logger.Error("Error decoding and decrypting a packet containing the server's IP address and public key: %v", err)
+		return err
+	}
 
 	ip := ipPacket.GetPlainData()
+	c.logger.Debug("Parsing the server's public key")
+	publicServerKey, err := curve.NewPublicKey(ipPacket.GetPlainData()[4:])
+	if err != nil {
+		c.logger.Error("Error parsing the server's public key: %v", err)
+		return err
+	}
+
+	c.logger.Debug("Conducting the ECDH")
+	secret, err := privateClientKey.ECDH(publicServerKey)
+	if err != nil {
+		c.logger.Error("ECDH execution error: %v", err)
+		return err
+	}
+	c.computeNextSessionRecvKey(secret)
+	c.computeNextSessionSentKey(secret)
 
 	c.logger.Debug("Creating a TUN interface")
 	tun, err := tunnel.NewTunnel(
@@ -204,7 +236,7 @@ func (c *Client) writerTunnel() {
 				c.logger.Error("Failed to write packet in tun: %v", err)
 			}
 
-			c.computNextSessionRecvKey(packet.GetSalt())
+			c.computeNextSessionRecvKey(packet.GetSalt())
 		}
 	}
 }
@@ -248,13 +280,13 @@ func (c *Client) readerTunnel() {
 				continue
 			}
 
-			c.computNextSessionSentKey(salt)
+			c.computeNextSessionSentKey(salt)
 
 		}
 	}
 }
 
-func (c *Client) computNextSessionSentKey(salt []byte) {
+func (c *Client) computeNextSessionSentKey(salt []byte) {
 	c.hasherLock.Lock()
 	defer c.hasherLock.Unlock()
 	c.hasher.Reset()
@@ -264,7 +296,7 @@ func (c *Client) computNextSessionSentKey(salt []byte) {
 	c.sessionSentKey = c.hasher.Sum(nil)
 }
 
-func (c *Client) computNextSessionRecvKey(salt []byte) {
+func (c *Client) computeNextSessionRecvKey(salt []byte) {
 	c.hasherLock.Lock()
 	defer c.hasherLock.Unlock()
 	c.hasher.Reset()
