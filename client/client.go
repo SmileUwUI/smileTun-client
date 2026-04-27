@@ -89,7 +89,7 @@ func (c *Client) Run() (err error) {
 	packet.AddData(timestampBytes)
 
 	c.logger.Trace("Assembly a packet with a username")
-	err = packet.PackageAssembly(c.initPassword[:], []byte{})
+	err = packet.PackageAssembly(c.initPassword[:], []byte{}, false)
 	if err != nil {
 		c.logger.Error("An error occurred while creating the packet with the username: %v", err)
 		return err
@@ -143,7 +143,7 @@ func (c *Client) Run() (err error) {
 	okPacket.AddData(publicClientKey.Bytes())
 
 	c.logger.Trace("Assembly the packet with connection establishment confirmation ")
-	okPacket.PackageAssembly(c.sessionSentKey, []byte{})
+	okPacket.PackageAssembly(c.sessionSentKey, []byte{}, false)
 	c.logger.Trace("Sending a packet confirming that the connection has been established ")
 	if _, err = c.conn.Write(okPacket.GetRawData()); err != nil {
 		c.logger.Error("Error sending the connection establishment acknowledgment packet: %v", err)
@@ -268,7 +268,7 @@ func (c *Client) readerTunnel() {
 			salt, err := crypto.RandomBytes(8)
 			packet.AddData(rawPacket[:n])
 
-			err = packet.PackageAssembly(c.sessionSentKey, salt)
+			err = packet.PackageAssembly(c.sessionSentKey, salt, false)
 			if err != nil {
 				c.logger.Error("Error while building the package: %v", err)
 				continue
