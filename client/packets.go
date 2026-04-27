@@ -2,60 +2,120 @@ package client
 
 import (
 	"encoding/binary"
-	"net"
+	"errors"
+	"fmt"
 	"smiletun-client/crypto"
-	"smiletun-client/logger"
 )
 
-type Packet struct {
-	SourceAddress      *net.IP
-	DestinationAddress *net.IP
-	Data               []byte
-	logger             *logger.Logger
+type TypePacket uint8
+
+const (
+	PlainPacket TypePacket = 0
+	RawPacket   TypePacket = 1
+)
+
+type StreamingPacket struct {
+	salt       []byte
+	rawData    []byte
+	plainData  []byte
+	cipherData []byte
+	typePacket TypePacket
 }
 
-func NewPacket(data []byte, logger *logger.Logger) (packet *Packet) {
-	sourceIP := net.IP(data[12:16])
-	destIP := net.IP(data[16:20])
-	return &Packet{
-		SourceAddress:      &sourceIP,
-		DestinationAddress: &destIP,
-		Data:               data,
-		logger:             logger,
+func NewPlainPacket() (packet *StreamingPacket) {
+	return &StreamingPacket{
+		typePacket: PlainPacket,
 	}
 }
 
-func (p *Packet) PackageAssembly(serialNumber uint32, salt [8]byte, key []byte) (finallyPacket []byte, err error) {
-	plainPacket := make([]byte, 8+len(p.Data)) // salt (8 bytes) + data (n bytes)
+func NewRawPacket() (packet *StreamingPacket) {
+	return &StreamingPacket{
+		typePacket: RawPacket,
+	}
+}
 
-	copy(plainPacket[0:8], salt[:])
-	copy(plainPacket[8:len(p.Data)+8], p.Data)
+func (s *StreamingPacket) AddData(data []byte) error {
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
 
-	cipherPacket, nonce, err := crypto.EncryptChaCha20Poly1305(plainPacket, key)
+	if s.typePacket == PlainPacket {
+		s.plainData = append(s.plainData, dataCopy...)
+	} else if s.typePacket == RawPacket {
+		s.rawData = append(s.rawData, dataCopy...)
+	} else {
+		return errors.New("unknown packet type")
+	}
+
+	return nil
+}
+
+func (s *StreamingPacket) PackageAssembly(key, salt []byte) (err error) {
+	if s.typePacket != PlainPacket {
+		return errors.New("this operation is available only for the PlainPacket package type")
+	}
+
+	s.salt = salt
+	var nonce []byte
+	plainDataWithSalt := make([]byte, len(s.plainData)+len(salt))
+	copy(plainDataWithSalt[:len(salt)], salt)
+	copy(plainDataWithSalt[len(salt):], s.plainData)
+
+	s.cipherData, nonce, err = crypto.EncryptChaCha20Poly1305(plainDataWithSalt, key)
 	if err != nil {
-		p.logger.Error("Failed to encrypt packet: %v", err)
-		return nil, err
-
+		return fmt.Errorf("packet decryption error: %v", err)
 	}
-	p.logger.Trace("Packet encrypted (cipher size: %d bytes)", len(cipherPacket))
 
-	lenCipherPacketBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenCipherPacketBytes[0:2], uint16(len(nonce)+len(cipherPacket)+2))
-	p.logger.Trace("Total packet size: %d bytes", len(nonce)+len(cipherPacket)+2)
+	s.rawData = make([]byte, len(s.cipherData)+len(nonce)+2+2) // size CipherData + size Nonce + size length RawData + size length CipherData
 
-	finallyPacket = make([]byte, len(nonce)+len(cipherPacket)+2+2)
-	copy(finallyPacket[4:16], nonce)
-	copy(finallyPacket[16:16+len(cipherPacket)], cipherPacket)
-	finallyPacket = crypto.Trashfication(finallyPacket, 400, 1300)
-	lenPacketBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenPacketBytes[0:2], uint16(len(finallyPacket)))
+	binary.BigEndian.PutUint16(s.rawData[2:4], uint16(len(s.cipherData)+len(nonce)+2))
+	copy(s.rawData[4:16], nonce)
+	copy(s.rawData[16:], s.cipherData)
 
-	finallyPacket[0] = lenPacketBytes[0] ^ key[0]
-	finallyPacket[1] = lenPacketBytes[1] ^ key[1]
-	finallyPacket[2] = lenCipherPacketBytes[0] ^ key[2]
-	finallyPacket[3] = lenCipherPacketBytes[1] ^ key[3]
+	s.rawData = crypto.Trashfication(s.rawData, 300, 1500)
 
-	p.logger.Trace("Added trashfication (final size: %d bytes)", len(finallyPacket))
+	binary.BigEndian.PutUint16(s.rawData[:2], uint16(len(s.rawData)))
 
-	return finallyPacket, nil
+	s.rawData[0] = s.rawData[0] ^ key[0]
+	s.rawData[1] = s.rawData[1] ^ key[1]
+	s.rawData[2] = s.rawData[2] ^ key[2]
+	s.rawData[3] = s.rawData[3] ^ key[3]
+
+	return nil
+}
+
+func (s *StreamingPacket) DecodeAndDecrypt(key []byte, withSalt bool) (err error) {
+	if s.typePacket != RawPacket {
+		return errors.New("this operation is available only for the RawPacket package type")
+	}
+
+	lengthCipherDataBytes := s.rawData[2:4]
+	lengthCipherDataBytes[0] = lengthCipherDataBytes[0] ^ key[2]
+	lengthCipherDataBytes[1] = lengthCipherDataBytes[1] ^ key[3]
+
+	lengthCipherData := binary.BigEndian.Uint16(lengthCipherDataBytes)
+	s.cipherData = s.rawData[4 : lengthCipherData+2]
+
+	s.plainData, err = crypto.DecryptChaCha20Poly1305(s.cipherData[12:], s.cipherData[:12], key)
+	if err != nil {
+		return fmt.Errorf("packet encryption error: %v", err)
+	}
+
+	if withSalt {
+		s.salt = s.plainData[:8]
+		s.plainData = s.plainData[8:]
+	}
+
+	return nil
+}
+
+func (s *StreamingPacket) GetRawData() (data []byte) {
+	return s.rawData
+}
+
+func (s *StreamingPacket) GetPlainData() (data []byte) {
+	return s.plainData
+}
+
+func (s *StreamingPacket) GetSalt() (salt []byte) {
+	return s.salt
 }

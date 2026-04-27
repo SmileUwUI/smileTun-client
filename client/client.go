@@ -27,20 +27,17 @@ type Client struct {
 	logger         *logger.Logger
 	countRecv      uint32
 	countSent      uint32
+
+	stopCh chan struct{}
 }
 
 func NewClient(host string, port int, initPassword [32]byte, username, password [16]byte, logger *logger.Logger) (client *Client, err error) {
-	logger.Info("Getting default route information for host: %s", host)
-
 	routeInfo, err := getDefaultRouteNetlink()
 	if err != nil {
 		logger.Error("Failed to get route information: %v", err)
 		return nil, fmt.Errorf("error retrieving route information: %w", err)
 	}
 
-	logger.Debug("Default route found - Gateway: %s, Interface: %s", routeInfo.Gateway, routeInfo.Interface)
-
-	logger.Debug("Adding server route: %s via %s dev %s", host, routeInfo.Gateway, routeInfo.Interface)
 	cmd := exec.Command("ip", "route", "add", host,
 		"via", routeInfo.Gateway, "dev", routeInfo.Interface)
 
@@ -49,8 +46,6 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 		return nil, fmt.Errorf("failed to add server route: %w", err)
 	}
 
-	logger.Debug("Server route added successfully")
-
 	return &Client{
 		host:         host,
 		port:         port,
@@ -58,13 +53,13 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 		username:     username,
 		password:     password,
 		logger:       logger,
+		stopCh:       make(chan struct{}),
 	}, nil
 }
 
 func (c *Client) Run() (err error) {
 	addr := fmt.Sprintf("%s:%d", c.host, c.port)
 
-	c.logger.Info("Connecting to the server at %s", addr)
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		c.logger.Error("Failed to connect to server: %v", err)
@@ -72,94 +67,79 @@ func (c *Client) Run() (err error) {
 	}
 	c.conn = conn.(*net.TCPConn)
 	c.conn.SetNoDelay(true)
-	c.logger.Info("Connected to server successfully")
 
-	timestamp := time.Now().Unix()
+	c.sessionRecvKey = c.initPassword[:]
+	c.sessionSentKey = c.initPassword[:]
+
+	packet := NewPlainPacket()
+
 	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(timestamp))
+	binary.BigEndian.PutUint64(timestampBytes, uint64(time.Now().Unix()))
 
-	c.logger.Debug("Creating authentication packet with timestamp: %d", timestamp)
+	packet.AddData(c.username[:])
+	packet.AddData(timestampBytes)
 
-	packet := make([]byte, 24)
-	copy(packet[:16], c.username[:])
-	copy(packet[16:], timestampBytes)
-
-	c.logger.Debug("Encrypting authentication packet with init password")
-	cipherPacket, nonce, _ := crypto.EncryptChaCha20Poly1305(packet, c.initPassword[:])
-
-	rawPacket := make([]byte, len(nonce)+len(cipherPacket))
-
-	copy(rawPacket[:12], nonce)
-	copy(rawPacket[12:], cipherPacket)
-
-	packet = crypto.Trashfication(rawPacket, 400, 1317)
-
-	c.logger.Debug("Sending authentication packet (size: %d bytes)", len(packet))
-	c.conn.Write(packet)
-	c.logger.Info("Authentication packet sent")
-
-	c.logger.Debug("Waiting for salt packet from server")
-	saltPacket := make([]byte, 4096)
-	if _, err = c.conn.Read(saltPacket); err != nil {
-		c.logger.Error("Failed to read salt packet: %v", err)
-		return
+	packet.PackageAssembly(c.initPassword[:], []byte{})
+	if _, err = c.conn.Write(packet.GetRawData()); err != nil {
+		c.logger.Error("Error sending a packet with username: %v", err)
+		return err
 	}
-	saltPacket = saltPacket[:60]
-	c.logger.Debug("Salt packet received (size: %d bytes)", len(saltPacket))
 
-	nonce = saltPacket[:12]
-	salt, err := crypto.DecryptChaCha20Poly1305(saltPacket[12:], nonce, c.initPassword[:])
+	saltPacket, err := c.readPacket()
 	if err != nil {
-		c.logger.Error("Failed to decrypt salt packet: %v", err)
-		return
+		c.logger.Error("Error reading the salt packet: %v", err)
+		return err
 	}
-	c.logger.Debug("Salt decrypted successfully")
 
-	c.logger.Debug("Deriving session key from password and salt")
+	err = saltPacket.DecodeAndDecrypt(c.initPassword[:], false)
+	if err != nil {
+		c.logger.Error("Error decoding and decrypting a salted packet: %v", err)
+		return err
+	}
+
 	sessionSentKeyHasher := sha256.New()
 	sessionSentKeyHasher.Write(c.password[:])
 	sessionSentKeyHasher.Write([]byte(":"))
-	sessionSentKeyHasher.Write(salt[0:16])
+	sessionSentKeyHasher.Write(saltPacket.GetPlainData()[0:16])
 
 	c.sessionSentKey = sessionSentKeyHasher.Sum(nil)
 
 	sessionRecvKeyHasher := sha256.New()
 	sessionRecvKeyHasher.Write(c.password[:])
 	sessionRecvKeyHasher.Write([]byte(":"))
-	sessionRecvKeyHasher.Write(salt[16:32])
+	sessionRecvKeyHasher.Write(saltPacket.GetPlainData()[16:32])
 
 	c.sessionRecvKey = sessionRecvKeyHasher.Sum(nil)
 
-	cipherOkPacket, nonce, _ := crypto.EncryptChaCha20Poly1305([]byte{0xFF}, c.sessionSentKey)
+	okPacket := NewPlainPacket()
+	okPacket.AddData([]byte{0xFF})
 
-	okPacket := make([]byte, len(cipherOkPacket)+len(nonce))
-	copy(okPacket[:12], nonce)
-	copy(okPacket[12:], cipherOkPacket)
-
-	c.conn.Write(crypto.Trashfication(okPacket, 300, 1300))
-	ipPacket := make([]byte, 4096)
-	if _, err = c.conn.Read(ipPacket); err != nil {
-		c.logger.Error("Failed to read salt packet: %v", err)
-		return
+	okPacket.PackageAssembly(c.sessionSentKey, []byte{})
+	if _, err = c.conn.Write(okPacket.GetRawData()); err != nil {
+		c.logger.Error("Error sending the connection establishment acknowledgment packet: %v", err)
+		return err
 	}
-	ipPacket = ipPacket[:32]
 
-	ip, err := crypto.DecryptChaCha20Poly1305(ipPacket[12:], ipPacket[:12], c.sessionRecvKey)
+	ipPacket, err := c.readPacket()
 	if err != nil {
-		c.logger.Error("Failed to decrypt ip packet: %v", err)
-		return
+		c.logger.Error("Error reading the packet with IP address: %v", err)
+		return err
 	}
+	ipPacket.DecodeAndDecrypt(c.sessionRecvKey, false)
 
-	c.logger.Info("Creating TUN interface: smile-tun0")
+	ip := ipPacket.GetPlainData()
+
 	tun, err := tunnel.NewTunnel(
 		"smile-tun0",
 		1500,
 		net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])),
 		net.IPv4Mask(255, 255, 255, 0),
-		[]*net.IPNet{
-			{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
-		},
 	)
+
+	if err != nil {
+		c.logger.Error("Failed to create tunnel: %v", err)
+		return fmt.Errorf("error create tunnel: %v", err)
+	}
 
 	err = tun.Up()
 	if err != nil {
@@ -167,85 +147,137 @@ func (c *Client) Run() (err error) {
 		return err
 	}
 
-	if err != nil {
-		c.logger.Error("Failed to create tunnel: %v", err)
-		return fmt.Errorf("error create tunnel: %v", err)
-	}
-
 	c.tunnel = &tun
-	c.logger.Info("TUN interface created successfully")
 
-	c.logger.Info("Session key derived successfully")
-
-	c.logger.Info("Starting tunnel")
-	c.startTunnel()
+	go c.startTunnel()
+	go c.writerTunnel()
 
 	return nil
 }
 
-func (c *Client) startTunnel() (err error) {
-	c.logger.Info("Bringing TUN interface up")
+func (c *Client) Stop() {
+	close(c.stopCh)
+}
+
+func (c *Client) writerTunnel() {
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+			packet, err := c.readPacket()
+			c.countRecv++
+			if err != nil {
+				c.logger.Error("Failed to read packet: %v", err)
+				if err.Error() == "EOF" {
+					return
+				}
+				continue
+			}
+
+			err = packet.DecodeAndDecrypt(c.sessionRecvKey, true)
+			if err != nil {
+				c.logger.Error("Failed to decrypt packet: %v", err)
+				continue
+			}
+
+			_, err = (*c.tunnel).Write(packet.GetPlainData())
+
+			if err != nil {
+				c.logger.Error("Failed to write packet in tun: %v", err)
+			}
+
+			c.computNextSessionRecvKey(packet.GetSalt())
+		}
+	}
+}
+
+func (c *Client) readPacket() (packet *StreamingPacket, err error) {
+	lenPacketBytes, err := c.read(2)
+	if err != nil {
+		c.logger.Error("%v", err)
+		return nil, err
+	}
+
+	packet = NewRawPacket()
+	packet.AddData(lenPacketBytes)
+
+	lenPacketBytes[0] = lenPacketBytes[0] ^ c.sessionRecvKey[0]
+	lenPacketBytes[1] = lenPacketBytes[1] ^ c.sessionRecvKey[1]
+	lenPacket := binary.BigEndian.Uint16(lenPacketBytes)
+
+	rawPacket, err := c.read(lenPacket - 2)
+	if err != nil {
+		return nil, err
+	}
+	packet.AddData(rawPacket)
+
+	return packet, nil
+}
+
+func (c *Client) read(length uint16) (data []byte, err error) {
+	if length == 0 {
+		return []byte{}, nil
+	}
+
+	data = make([]byte, length)
+	remaining := length
+	offset := 0
+
+	for remaining > 0 {
+		n, err := c.conn.Read(data[offset:])
+		if err != nil {
+			return nil, err
+		}
+		remaining -= uint16(n)
+		offset += n
+	}
+
+	return data, nil
+}
+
+func (c *Client) startTunnel() {
 	if err := (*c.tunnel).Up(); err != nil {
 		c.logger.Error("Failed to bring TUN interface up: %v", err)
-		return err
+		return
 	}
+	defer (*c.tunnel).Down()
 
-	c.logger.Info("Tunnel %s is up with IP %s", (*c.tunnel).Name(), (*c.tunnel).IP())
+	rawPacket := make([]byte, (*c.tunnel).MTU())
 
-	headerInfo := make([]byte, 4)
-
-	c.logger.Info("Starting packet processing loop")
 	for {
-		_, err := (*c.tunnel).Read(headerInfo)
-		if err != nil {
-			c.logger.Error("Failed to read from tunnel: %v", err)
-			return err
+		select {
+		case <-c.stopCh:
+			return
+		default:
+			n, err := (*c.tunnel).Read(rawPacket)
+			if err != nil {
+				c.logger.Error("Failed to read from tunnel: %v", err)
+				return
+			}
+
+			c.countSent++
+
+			packet := NewPlainPacket()
+
+			salt := crypto.RandomBytes(8)
+			packet.AddData(rawPacket[:n])
+
+			err = packet.PackageAssembly(c.sessionSentKey, salt)
+			if err != nil {
+				c.logger.Error("Error while building the package: %v", err)
+				continue
+			}
+
+			if _, err := c.conn.Write(packet.GetRawData()); err != nil {
+				c.logger.Error("Failed to send packet to server: %v", err)
+				continue
+			}
+
+			c.computNextSessionSentKey(salt)
+
 		}
-
-		if headerInfo[0]>>4 != 0x04 {
-			continue
-		}
-
-		headerLength := binary.BigEndian.Uint16(headerInfo[2:4])
-		remainingPacket := make([]byte, headerLength-4)
-		n, err := (*c.tunnel).Read(remainingPacket)
-		if err != nil {
-			c.logger.Error("Failed to read from tunnel: %v", err)
-			return err
-		}
-
-		rawPacket := make([]byte, (*c.tunnel).MTU())
-		copy(rawPacket[:4], headerInfo)
-		copy(rawPacket[4:headerLength], remainingPacket)
-
-		c.countSent++
-		packet := NewPacket(rawPacket[:n], c.logger)
-
-		c.logger.Trace("Packet #%d", c.countSent)
-		c.logger.Trace("\tSource: %s", packet.SourceAddress.String())
-		c.logger.Trace("\tDestination: %s", packet.DestinationAddress.String())
-		c.logger.Debug("Processing packet #%d (size: %d bytes)", c.countSent, n)
-
-		salt := crypto.RandomBytes(8)
-
-		finallyPacket, err := packet.PackageAssembly(c.countSent, [8]byte(salt), c.sessionSentKey)
-		if err != nil {
-			c.logger.Error("Error while building the package: %v", err)
-			continue
-		}
-
-		if _, err := c.conn.Write(finallyPacket); err != nil {
-			c.logger.Error("Failed to send packet to server: %v", err)
-			continue
-		}
-
-		c.computNextSessionSentKey(salt)
-
-		c.logger.Debug("Packet #%d sent to server", c.countSent)
-		c.logger.Debug("_________________________")
 	}
-
-	return nil
 }
 
 func (c *Client) computNextSessionSentKey(salt []byte) {
@@ -255,6 +287,15 @@ func (c *Client) computNextSessionSentKey(salt []byte) {
 	hasher.Write(salt)
 
 	c.sessionSentKey = hasher.Sum(nil)
+}
+
+func (c *Client) computNextSessionRecvKey(salt []byte) {
+	hasher := sha256.New()
+	hasher.Write(c.sessionRecvKey)
+	hasher.Write([]byte(":"))
+	hasher.Write(salt)
+
+	c.sessionRecvKey = hasher.Sum(nil)
 }
 
 type RouteInfo struct {
