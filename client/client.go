@@ -8,14 +8,11 @@ import (
 	"fmt"
 	"hash"
 	"net"
-	"os/exec"
 	"smiletun-client/crypto"
 	"smiletun-client/logger"
 	"smiletun-client/tunnel"
 	"sync"
 	"time"
-
-	"github.com/vishvananda/netlink"
 )
 
 type Client struct {
@@ -40,20 +37,6 @@ type Client struct {
 }
 
 func NewClient(host string, port int, initPassword [32]byte, username, password [16]byte, logger *logger.Logger) (client *Client, err error) {
-	routeInfo, err := getDefaultRouteNetlink()
-	if err != nil {
-		logger.Error("Failed to get route information: %v", err)
-		return nil, fmt.Errorf("error retrieving route information: %w", err)
-	}
-
-	cmd := exec.Command("ip", "route", "add", host,
-		"via", routeInfo.Gateway, "dev", routeInfo.Interface)
-
-	if err := cmd.Run(); err != nil && err.Error() != "exit status 2" {
-		logger.Error("Failed to add server route: %v", err)
-		return nil, fmt.Errorf("failed to add server route: %w", err)
-	}
-
 	return &Client{
 		host:         host,
 		port:         port,
@@ -156,7 +139,7 @@ func (c *Client) Run() (err error) {
 	if err != nil {
 		c.logger.Error("Error reading the packet with IP address: %v", err)
 		if err.Error() == "EOF" {
-			return
+			return err
 		}
 		return err
 	}
@@ -276,7 +259,7 @@ func (c *Client) writerTunnel() {
 }
 
 func (c *Client) readerTunnel() {
-	if err := (*c.tunnel).Up(); err != nil {
+	if err := (*c.tunnel).Up([]string{c.host}); err != nil {
 		c.logger.Error("Failed to bring TUN interface up: %v", err)
 		return
 	}
@@ -289,12 +272,12 @@ func (c *Client) readerTunnel() {
 		case <-c.stopCh:
 			return
 		default:
-			c.logger.Trace("Read packet from tunnel #%d", c.countSent)
 			n, err := (*c.tunnel).Read(rawPacket)
 			if err != nil {
 				c.logger.Error("Failed to read from tunnel: %v", err)
 				return
 			}
+			c.logger.Trace("Read packet from tunnel #%d", c.countSent)
 			c.countSent++
 
 			packet := NewPlainPacket()
@@ -388,41 +371,4 @@ func (c *Client) read(length uint16) (data []byte, err error) {
 	}
 
 	return data, nil
-}
-
-type RouteInfo struct {
-	Gateway   string
-	Interface string
-	Metric    int
-}
-
-func getDefaultRouteNetlink() (*RouteInfo, error) {
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to list routes: %w", err)
-	}
-
-	for _, route := range routes {
-		if route.Dst != nil {
-			info := &RouteInfo{}
-
-			if route.Gw != nil {
-				info.Gateway = route.Gw.String()
-			}
-
-			if route.LinkIndex > 0 {
-				link, err := netlink.LinkByIndex(route.LinkIndex)
-				if err == nil {
-					info.Interface = link.Attrs().Name
-				}
-			}
-
-			if info.Gateway != "" && info.Interface != "" {
-				return info, nil
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("default route not found")
 }
