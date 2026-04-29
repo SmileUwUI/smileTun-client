@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/songgao/water"
+	"github.com/vishvananda/netlink"
 )
 
 type LinuxTunnel struct {
@@ -193,8 +194,24 @@ func (t *LinuxTunnel) DeleteRoutes(routes []*net.IPNet) error {
 	return nil
 }
 
-func (t *LinuxTunnel) Up() error {
-	cmd := exec.Command("ip", "link", "set", "dev", t.name, "up")
+func (t *LinuxTunnel) Up(excludeHosts []string) error {
+	routeInfo, err := getDefaultRouteNetlink()
+	if err != nil {
+		return fmt.Errorf("error retrieving route information: %w", err)
+	}
+
+	var cmd *exec.Cmd
+	for _, host := range excludeHosts {
+		cmd = exec.Command("ip", "route", "add", host,
+			"via", routeInfo.Gateway, "dev", routeInfo.Interface)
+
+		if err := cmd.Run(); err != nil && err.Error() != "exit status 2" {
+			return fmt.Errorf("failed to add server route: %w", err)
+		}
+
+	}
+
+	cmd = exec.Command("ip", "link", "set", "dev", t.name, "up")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to bring up interface: %w", err)
 	}
@@ -250,4 +267,41 @@ func (t *LinuxTunnel) getPrefixLen() int {
 	}
 	len, _ := t.netmask.Size()
 	return len
+}
+
+type RouteInfo struct {
+	Gateway   string
+	Interface string
+	Metric    int
+}
+
+func getDefaultRouteNetlink() (*RouteInfo, error) {
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list routes: %w", err)
+	}
+
+	for _, route := range routes {
+		if route.Dst != nil {
+			info := &RouteInfo{}
+
+			if route.Gw != nil {
+				info.Gateway = route.Gw.String()
+			}
+
+			if route.LinkIndex > 0 {
+				link, err := netlink.LinkByIndex(route.LinkIndex)
+				if err == nil {
+					info.Interface = link.Attrs().Name
+				}
+			}
+
+			if info.Gateway != "" && info.Interface != "" {
+				return info, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("default route not found")
 }
