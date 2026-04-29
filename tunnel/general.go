@@ -10,7 +10,7 @@ type Tunnel interface {
 	Netmask() net.IPMask
 	MTU() int
 	SetIP(ip net.IP, netmask net.IPMask) error
-	Up(excludeHosts []string) error
+	Up(excludeIPs []string) error
 	Down() error
 	Close() error
 	IsRunning() bool

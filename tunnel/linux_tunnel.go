@@ -194,15 +194,15 @@ func (t *LinuxTunnel) DeleteRoutes(routes []*net.IPNet) error {
 	return nil
 }
 
-func (t *LinuxTunnel) Up(excludeHosts []string) error {
+func (t *LinuxTunnel) Up(excludeIPs []string) error {
 	routeInfo, err := getDefaultRouteNetlink()
 	if err != nil {
 		return fmt.Errorf("error retrieving route information: %w", err)
 	}
 
 	var cmd *exec.Cmd
-	for _, host := range excludeHosts {
-		cmd = exec.Command("ip", "route", "add", host,
+	for _, ip := range excludeIPs {
+		cmd = exec.Command("ip", "route", "add", ip,
 			"via", routeInfo.Gateway, "dev", routeInfo.Interface)
 
 		if err := cmd.Run(); err != nil && err.Error() != "exit status 2" {
