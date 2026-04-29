@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash"
+	mathRand "math/rand/v2"
 	"net"
 	"smiletun-client/crypto"
 	"smiletun-client/logger"
@@ -25,6 +26,8 @@ type Client struct {
 	sessionSentKey           []byte
 	sessionRecvKey           []byte
 	secretECDH               []byte
+	packetBuffer             []*StreamingPacket
+	sizeBatch                int
 	tunnel                   *tunnel.Tunnel
 	logger                   *logger.Logger
 	countRecv                uint32
@@ -32,6 +35,7 @@ type Client struct {
 	ephemeralPublicClientKey *ecdh.PublicKey
 	hasher                   hash.Hash
 	hasherLock               sync.Mutex
+	bufferLock               sync.Mutex
 
 	stopCh chan struct{}
 }
@@ -44,6 +48,8 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 		username:     username,
 		password:     password,
 		logger:       logger,
+		packetBuffer: []*StreamingPacket{},
+		sizeBatch:    1,
 		hasher:       sha256.New(),
 		stopCh:       make(chan struct{}),
 	}, nil
@@ -60,7 +66,7 @@ func (c *Client) Run() (err error) {
 	c.logger.Trace("The connection was established successfully")
 
 	c.conn = conn.(*net.TCPConn)
-	c.conn.SetNoDelay(true)
+	c.conn.SetNoDelay(false)
 
 	c.sessionRecvKey = c.initPassword[:]
 	c.sessionSentKey = c.initPassword[:]
@@ -187,6 +193,8 @@ func (c *Client) Run() (err error) {
 	c.logger.Debug("A daemon has been launched to read packets from the server and write them to the tunnel")
 	go c.writerTunnel()
 
+	go c.sender()
+
 	return nil
 }
 
@@ -296,10 +304,7 @@ func (c *Client) readerTunnel() {
 			}
 
 			c.logger.Trace("Sending a packet to server number #%d", c.countSent)
-			if _, err := c.conn.Write(packet.GetRawData()); err != nil {
-				c.logger.Error("Failed to send packet to server: %v", err)
-				continue
-			}
+			c.write(packet)
 
 			c.computeNextSessionSentKey(salt)
 			if packet.GetEcdhFlag() {
@@ -308,6 +313,40 @@ func (c *Client) readerTunnel() {
 			}
 		}
 	}
+}
+
+func (c *Client) sender() {
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+			c.bufferLock.Lock()
+
+			if len(c.packetBuffer) < c.sizeBatch {
+				c.bufferLock.Unlock()
+				continue
+			}
+
+			for _, packet := range c.packetBuffer {
+				_, err := c.conn.Write(packet.GetRawData())
+				if err != nil {
+					c.logger.Error("Error while writing: %v", err)
+				}
+			}
+			c.packetBuffer = []*StreamingPacket{}
+			c.sizeBatch = int(mathRand.Float64()*4) + 1
+			c.logger.Trace("Next size of batch: %d", c.sizeBatch)
+			c.bufferLock.Unlock()
+		}
+	}
+}
+
+func (c *Client) write(packet *StreamingPacket) {
+	c.bufferLock.Lock()
+	defer c.bufferLock.Unlock()
+
+	c.packetBuffer = append(c.packetBuffer, packet)
 }
 
 func (c *Client) computeNextSessionSentKey(salt []byte) {
