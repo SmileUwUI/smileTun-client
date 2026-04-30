@@ -37,6 +37,7 @@ type Client struct {
 	hasherLock               sync.Mutex
 	bufferLock               sync.Mutex
 
+	wg     sync.WaitGroup
 	stopCh chan struct{}
 }
 
@@ -205,21 +206,32 @@ func (c *Client) Run() (err error) {
 
 	c.tunnel = &tun
 
-	c.logger.Debug("Launch the goroutine to read the tunnel and send packets to the server")
+	c.wg.Add(3)
 	go c.readerTunnel()
-	c.logger.Debug("A daemon has been launched to read packets from the server and write them to the tunnel")
+	c.logger.Debug("Launch the goroutine to read the tunnel")
+
 	go c.writerTunnel()
+	c.logger.Debug("A daemon has been launched to read packets from the server and write them to the tunnel")
 
 	go c.sender()
+	c.logger.Debug("Launched a goroutine to send packets to the server.")
 
 	return nil
 }
 
 func (c *Client) Stop() {
 	close(c.stopCh)
+	c.logger.Debug("Wait for all goroutines to complete")
+	c.wg.Wait()
+	c.logger.Debug("All goroutines are complete")
+	c.logger.Debug("Setting tunnel DOWN")
+	(*c.tunnel).Down()
+	c.logger.Debug("Close tunnel")
+	(*c.tunnel).Close()
 }
 
 func (c *Client) writerTunnel() {
+	defer c.wg.Done()
 	var secret []byte
 	for {
 		select {
@@ -284,6 +296,8 @@ func (c *Client) writerTunnel() {
 }
 
 func (c *Client) readerTunnel() {
+	defer c.wg.Done()
+
 	if err := (*c.tunnel).Up([]string{c.host}); err != nil {
 		c.logger.Error("Failed to bring TUN interface up: %v", err)
 		return
@@ -333,6 +347,7 @@ func (c *Client) readerTunnel() {
 }
 
 func (c *Client) sender() {
+	defer c.wg.Done()
 	for {
 		select {
 		case <-c.stopCh:
