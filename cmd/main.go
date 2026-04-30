@@ -89,9 +89,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	if loggerLevel < 0 || loggerLevel > 5 {
+	if loggerLevel < 1 || loggerLevel > 4 {
 		fmt.Fprintf(os.Stderr, "Error: Invalid log level %d. Log level must be between 0 and 5\n", loggerLevel)
-		fmt.Fprintln(os.Stderr, "0: ERROR, 1: WARNING, 2: INFO, 3: DEBUG, 4: TRACE, 5: VERBOSE")
+		fmt.Fprintln(os.Stderr, "1: ERROR, 2: INFO, 3: DEBUG, 4: TRACE")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -137,7 +137,7 @@ func main() {
 	copy(usernameArray[:], username)
 	copy(passwordArray[:], password)
 
-	log := logger.NewLogger(logger.LogLevelDebug)
+	log := logger.NewLogger(loggerLevel)
 
 	clientInstance, err := client.NewClient(host, port, initPasswordArray, usernameArray, passwordArray, log)
 	if err != nil {
