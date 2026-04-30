@@ -80,7 +80,7 @@ func (s *StreamingPacket) PackageAssembly(key, salt, publicKey []byte, fake, ecd
 	copy(s.rawData[5:17], nonce)
 	copy(s.rawData[17:], s.cipherData)
 
-	s.rawData = crypto.Trashfication(s.rawData, 300, 1500)
+	s.rawData = crypto.Trashfication(s.rawData, 300, 800)
 
 	binary.BigEndian.PutUint16(s.rawData[:2], uint16(len(s.rawData)))
 
