@@ -106,18 +106,30 @@ func (c *Client) Run() (err error) {
 		return err
 	}
 
+	firstSalt, err := saltPacket.GetSlicePlainData(0, 16)
+	if err != nil {
+		c.logger.Error("Error when attempting to retrieve the first salt: %v", err)
+		return fmt.Errorf("error when attempting to retrieve the first salt: %v", err)
+	}
+
+	secondSalt, err := saltPacket.GetSlicePlainData(16, 32)
+	if err != nil {
+		c.logger.Error("Error when attempting to retrieve the second salt: %v", err)
+		return fmt.Errorf("error when attempting to retrieve the second salt: %v", err)
+	}
+
 	c.logger.Trace("Calculating the send key")
 	c.hasher.Reset()
 	c.hasher.Write(c.password[:])
 	c.hasher.Write([]byte(":"))
-	c.hasher.Write(saltPacket.GetPlainData()[0:16])
+	c.hasher.Write(firstSalt)
 	c.sessionSentKey = c.hasher.Sum(nil)
 
 	c.logger.Trace("Calculating the recv key")
 	c.hasher.Reset()
 	c.hasher.Write(c.password[:])
 	c.hasher.Write([]byte(":"))
-	c.hasher.Write(saltPacket.GetPlainData()[16:32])
+	c.hasher.Write(secondSalt)
 	c.sessionRecvKey = c.hasher.Sum(nil)
 
 	okPacket := NewPlainPacket()
@@ -156,7 +168,12 @@ func (c *Client) Run() (err error) {
 		return err
 	}
 
-	ip := ipPacket.GetPlainData()
+	ipBytes, err := ipPacket.GetSlicePlainData(0, 4)
+	if err != nil {
+		c.logger.Error("Error when attempting to retrieve the IP address: %v", err)
+		return fmt.Errorf("error when attempting to retrieve the IP address: %v", err)
+	}
+
 	c.logger.Debug("Parsing the server's public key")
 	publicServerKey, err := curve.NewPublicKey(ipPacket.GetPublicKey())
 	if err != nil {
@@ -177,7 +194,7 @@ func (c *Client) Run() (err error) {
 	tun, err := tunnel.NewTunnel(
 		"smile-tun0",
 		1500,
-		net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])),
+		net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3])),
 		net.IPv4Mask(255, 255, 255, 0),
 	)
 

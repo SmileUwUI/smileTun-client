@@ -159,3 +159,25 @@ func (s *StreamingPacket) GetPublicKey() (publicLey []byte) {
 func (s *StreamingPacket) GetEcdhFlag() (ecdhFlag bool) {
 	return s.ecdhFlag
 }
+
+func (s *StreamingPacket) GetSlicePlainData(start, end int) (slicePlainData []byte, err error) {
+	if start > end {
+		return nil, errors.New("the start index cannot be greater than the end index")
+	}
+
+	if len(s.plainData) == 0 {
+		return nil, errors.New("the size of `plainData` cannot be 0")
+	}
+
+	if start < 0 {
+		return nil, errors.New("the starting index cannot be less than 0")
+	}
+
+	if end > len(s.plainData) {
+		return nil, errors.New("the end index cannot exceed the packet length")
+	}
+
+	slicePlainData = s.plainData
+
+	return slicePlainData[start:end], nil
+}
