@@ -52,7 +52,10 @@ func NewTunnel(name string, mtu int, address net.IP, netmask net.IPMask) (Tunnel
 	}
 
 	if mtu > 0 {
-		tunnel.SetMTU(mtu)
+		err = tunnel.SetMTU(mtu)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return tunnel, nil
@@ -93,9 +96,13 @@ func (t *LinuxTunnel) SetIP(ip net.IP, netmask net.IPMask) error {
 	defer t.mu.Unlock()
 
 	if t.ip != nil {
-		exec.Command("ip", "addr", "del",
+		err := exec.Command("ip", "addr", "del",
 			fmt.Sprintf("%s/%d", t.ip, t.getPrefixLen()),
 			"dev", t.name).Run()
+
+		if err != nil {
+			return err
+		}
 	}
 
 	prefixLen, _ := netmask.Size()
@@ -141,7 +148,11 @@ func (t *LinuxTunnel) saveDefaultRoute() error {
 }
 
 func (t *LinuxTunnel) restoreDefaultRoute() error {
-	exec.Command("ip", "route", "del", "default").Run()
+	err := exec.Command("ip", "route", "del", "default").Run()
+
+	if err != nil {
+		return err
+	}
 
 	if t.oldGW != "" && t.oldIface != "" {
 		cmd := exec.Command("ip", "route", "add", "default", "via", t.oldGW, "dev", t.oldIface)
@@ -156,7 +167,10 @@ func (t *LinuxTunnel) SetupDefaultRoute() error {
 		return err
 	}
 
-	exec.Command("ip", "route", "del", "default").Run()
+	err := exec.Command("ip", "route", "del", "default").Run()
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.Command("ip", "route", "add", "default", "dev", t.name)
 	if err := cmd.Run(); err != nil {
@@ -172,7 +186,10 @@ func (t *LinuxTunnel) AddRoutes(routes []*net.IPNet) error {
 			continue
 		}
 
-		exec.Command("ip", "route", "del", route.String()).Run()
+		err := exec.Command("ip", "route", "del", route.String()).Run()
+		if err != nil {
+			return err
+		}
 
 		cmd := exec.Command("ip", "route", "add", route.String(), "dev", t.name)
 		if err := cmd.Run(); err != nil {
@@ -189,7 +206,10 @@ func (t *LinuxTunnel) DeleteRoutes(routes []*net.IPNet) error {
 			continue
 		}
 
-		exec.Command("ip", "route", "del", route.String(), "dev", t.name).Run()
+		err := exec.Command("ip", "route", "del", route.String(), "dev", t.name).Run()
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -216,7 +236,10 @@ func (t *LinuxTunnel) Up(excludeIPs []string) error {
 		return fmt.Errorf("failed to bring up interface: %w", err)
 	}
 
-	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	err = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	if err != nil {
+		return err
+	}
 
 	if err := t.SetupDefaultRoute(); err != nil {
 		return err
@@ -227,7 +250,10 @@ func (t *LinuxTunnel) Up(excludeIPs []string) error {
 }
 
 func (t *LinuxTunnel) Down() error {
-	t.restoreDefaultRoute()
+	err := t.restoreDefaultRoute()
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "down")
 	if err := cmd.Run(); err != nil {
@@ -239,7 +265,10 @@ func (t *LinuxTunnel) Down() error {
 }
 
 func (t *LinuxTunnel) Close() error {
-	t.Down()
+	err := t.Down()
+	if err != nil {
+		return err
+	}
 	return t.iface.Close()
 }
 
