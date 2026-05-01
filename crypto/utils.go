@@ -29,6 +29,7 @@ func Trashfication(source []byte, minLength, maxLength int) (result []byte) {
 	}
 
 	if targetLen < maxLength {
+		// #nosec G404
 		extra := rand.Intn(maxLength - targetLen + 1)
 		targetLen += extra
 	}
@@ -38,6 +39,8 @@ func Trashfication(source []byte, minLength, maxLength int) (result []byte) {
 	copy(result, source)
 
 	for i := len(source); i < targetLen; i++ {
+		// #nosec G115
+		// #nosec G404
 		result[i] = byte(rand.Intn(256))
 	}
 
