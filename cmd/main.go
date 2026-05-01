@@ -144,7 +144,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: Failed to create client: %v\n", err)
 		os.Exit(1)
 	}
-	clientInstance.Run()
+
+	err = clientInstance.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Client run error: %v", err)
+		os.Exit(1)
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan,
@@ -165,24 +170,7 @@ func isValidHex(s string) bool {
 	}
 
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-	return true
-}
-
-func isValidHexStrict(s string) bool {
-	if s == "" {
-		return true
-	}
-
-	if len(s)%2 != 0 {
-		return false
-	}
-
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return false
 		}
 	}
