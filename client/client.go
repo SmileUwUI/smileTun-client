@@ -233,14 +233,11 @@ func (c *Client) Stop() {
 	c.logger.Debug("Wait for all goroutines to complete")
 	c.wg.Wait()
 	c.logger.Debug("All goroutines are complete")
-	c.logger.Debug("Setting tunnel DOWN")
-	err := (*c.tunnel).Down()
-	if err != nil {
-		c.logger.Error("Error setting the tunnel to DOWN status: %v", err)
-	}
-
 	c.logger.Debug("Close tunnel")
-	(*c.tunnel).Close()
+	err := (*c.tunnel).Close()
+	if err != nil {
+		c.logger.Error("An error occurred while closing the tunnel: %v", err)
+	}
 }
 
 func (c *Client) writerTunnel() {
