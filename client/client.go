@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash"
-	mathRand "math/rand/v2"
+	"math/big"
 	"net"
 	"smiletun-client/crypto"
 	"smiletun-client/logger"
@@ -57,7 +57,7 @@ func NewClient(host string, port int, initPassword [32]byte, username, password 
 }
 
 func (c *Client) Run() (err error) {
-	addr := fmt.Sprintf("%s:%d", c.host, c.port)
+	addr := net.JoinHostPort(c.host, fmt.Sprintf("%d", c.port))
 
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
@@ -67,7 +67,6 @@ func (c *Client) Run() (err error) {
 	c.logger.Trace("The connection was established successfully")
 
 	c.conn = conn.(*net.TCPConn)
-	c.conn.SetNoDelay(false)
 
 	c.sessionRecvKey = c.initPassword[:]
 	c.sessionSentKey = c.initPassword[:]
@@ -75,7 +74,12 @@ func (c *Client) Run() (err error) {
 	packet := NewPlainPacket()
 
 	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(time.Now().Unix()))
+	now := time.Now().Unix()
+	if now < 0 {
+		now = 0
+	}
+
+	binary.BigEndian.PutUint64(timestampBytes, uint64(now))
 
 	packet.AddData(c.username[:])
 	packet.AddData(timestampBytes)
@@ -146,7 +150,12 @@ func (c *Client) Run() (err error) {
 	publicClientKey := privateClientKey.PublicKey()
 
 	c.logger.Trace("Assembly the packet with connection establishment confirmation ")
-	okPacket.PackageAssembly(c.sessionSentKey, []byte{}, publicClientKey.Bytes(), false, true)
+	err = okPacket.PackageAssembly(c.sessionSentKey, []byte{}, publicClientKey.Bytes(), false, true)
+	if err != nil {
+		c.logger.Error("Error assembly a packet to confirm the connection setup: %v", err)
+		return err
+	}
+
 	c.logger.Trace("Sending a packet confirming that the connection has been established ")
 	if _, err = c.conn.Write(okPacket.GetRawData()); err != nil {
 		c.logger.Error("Error sending the connection establishment acknowledgment packet: %v", err)
@@ -225,7 +234,11 @@ func (c *Client) Stop() {
 	c.wg.Wait()
 	c.logger.Debug("All goroutines are complete")
 	c.logger.Debug("Setting tunnel DOWN")
-	(*c.tunnel).Down()
+	err := (*c.tunnel).Down()
+	if err != nil {
+		c.logger.Error("Error setting the tunnel to DOWN status: %v", err)
+	}
+
 	c.logger.Debug("Close tunnel")
 	(*c.tunnel).Close()
 }
@@ -302,7 +315,12 @@ func (c *Client) readerTunnel() {
 		c.logger.Error("Failed to bring TUN interface up: %v", err)
 		return
 	}
-	defer (*c.tunnel).Down()
+	defer func() {
+		err := (*c.tunnel).Down()
+		if err != nil {
+			c.logger.Error("Error setting the tunnel to DOWN status: %v", err)
+		}
+	}()
 
 	rawPacket := make([]byte, (*c.tunnel).MTU())
 
@@ -322,6 +340,10 @@ func (c *Client) readerTunnel() {
 			packet := NewPlainPacket()
 
 			salt, err := crypto.RandomBytes(8)
+			if err != nil {
+				c.logger.Error("Error generating random bytes: %v", err)
+			}
+
 			packet.AddData(rawPacket[:n])
 			if c.ephemeralPublicClientKey != nil {
 				err = packet.PackageAssembly(c.sessionSentKey, salt, c.ephemeralPublicClientKey.Bytes(), false, true)
@@ -367,7 +389,12 @@ func (c *Client) sender() {
 				}
 			}
 			c.packetBuffer = []*StreamingPacket{}
-			c.sizeBatch = int(mathRand.Float64()*4) + 1
+			n, err := rand.Int(rand.Reader, big.NewInt(4))
+			if err != nil {
+				c.logger.Error("Error generating a random batch size: %v", err)
+			}
+
+			c.sizeBatch = int(n.Int64()) + 1
 			c.logger.Trace("Next size of batch: %d", c.sizeBatch)
 			c.bufferLock.Unlock()
 		}
@@ -437,6 +464,10 @@ func (c *Client) read(length uint16) (data []byte, err error) {
 		if err != nil {
 			return nil, err
 		}
+		if n < 0 {
+			n = 0
+		}
+
 		remaining -= uint16(n)
 		offset += n
 	}

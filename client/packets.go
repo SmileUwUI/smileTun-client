@@ -45,9 +45,10 @@ func (s *StreamingPacket) AddData(data []byte) {
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 
-	if s.typePacket == PlainPacket {
+	switch s.typePacket {
+	case PlainPacket:
 		s.plainData = append(s.plainData, dataCopy...)
-	} else if s.typePacket == RawPacket {
+	case RawPacket:
 		s.rawData = append(s.rawData, dataCopy...)
 	}
 }
@@ -76,15 +77,29 @@ func (s *StreamingPacket) PackageAssembly(key, salt, publicKey []byte, fake, ecd
 
 	s.rawData = make([]byte, len(s.cipherData)+len(nonce)+2+2+1) // size CipherData + size Nonce + size length RawData + size length CipherData + size flags byte
 
-	binary.BigEndian.PutUint16(s.rawData[3:5], uint16(len(s.cipherData)+len(nonce)+2))
+	lenCipherData := len(s.cipherData) + len(nonce) + 2
+	if lenCipherData < 0 {
+		lenCipherData = 0
+	}
+
+	binary.BigEndian.PutUint16(s.rawData[3:5], uint16(lenCipherData))
 	copy(s.rawData[5:17], nonce)
 	copy(s.rawData[17:], s.cipherData)
 
 	s.rawData = crypto.Trashfication(s.rawData, 300, 800)
 
-	binary.BigEndian.PutUint16(s.rawData[:2], uint16(len(s.rawData)))
+	lenRawData := len(s.rawData)
+	if lenRawData < 0 {
+		lenRawData = 0
+	}
+
+	binary.BigEndian.PutUint16(s.rawData[:2], uint16(lenRawData))
 
 	flagsBytes, err := crypto.RandomBytes(1)
+	if err != nil {
+		return fmt.Errorf("error generating random bytes: %v", err)
+	}
+
 	flags := flagsBytes[0] & 0b11111100
 	if s.fakeFlag {
 		flags = flags | 0b00000001
